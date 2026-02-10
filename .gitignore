@@ -1,0 +1,7 @@
+.env
+.env.txt
+*.env
+__pycache__/
+temp*/
+*.sqlite
+*.db
