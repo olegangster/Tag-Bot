@@ -416,19 +416,17 @@ class QueueManager:
     
     async def _publish_post(self, item, media_processor, bot, config):
         """Публикует один пост"""
-        # Получаем chat_id
         platform_id = item['platform_id']
         chat_id = config['platforms'][platform_id]['chat_id']
         thread_id = None
-        
+    
         if item.get('topic'):
             thread_id = config['platforms'][platform_id]['topics'][item['topic']].get('thread_id')
-        
-        # Проверяем, это комикс или обычный пост
+    
+        # Комикс
         if item.get('is_comic', False):
-            # Публикация комикса
             caption = self._format_comic_caption(item, config)
-            
+    
             if thread_id:
                 await bot.send_message(
                     chat_id=chat_id,
@@ -444,45 +442,36 @@ class QueueManager:
                     parse_mode='HTML',
                     disable_web_page_preview=False
                 )
+            return
+    
+        # Обычный пост с медиа
+        processed_media = await media_processor.process_batch(item['media_files'])
+        if not processed_media:
+            raise Exception("Не удалось обработать медиа")
+    
+        caption = self._format_caption(item, config)
+    
+        if len(processed_media) == 1:
+            media_type, file_path = processed_media[0]
+            await media_processor.send_single_media(
+                chat_id=chat_id,
+                media_type=media_type,
+                file_path=file_path,
+                caption=caption,
+                thread_id=thread_id
+            )
         else:
-            # Обычный пост с медиа
-            # Обрабатываем медиа
-            processed_media = await media_processor.process_batch(item['media_files'])
-            
-            if not processed_media:
-                raise Exception("Не удалось обработать медиа")
-            
-            # Формируем caption
-            caption = self._format_caption(item, config)
-            
-            # Публикуем
-            if len(processed_media) == 1:
-                media_type, file_path = processed_media[0]
-                await media_processor.send_single_media(
-                    chat_id=chat_id,
-                    media_type=media_type,
-                    file_path=file_path,
-                    caption=caption,
-                    thread_id=thread_id
-                )
-            else:
-                await media_processor.send_media_group(
-                    chat_id=chat_id,
-                    media_paths=processed_media,
-                    caption=caption,
-                    thread_id=thread_id
-                )
-            
-            # Очищаем файлы
-            paths = [path for _, path in processed_media]
-            media_processor.cleanup_specific(paths)
-        
-        except asyncio.CancelledError:
-            logger.info("Обработка очереди отменена")
-        except Exception as e:
-            logger.error(f"Ошибка обработки очереди: {e}")
-        finally:
-            self.running = False
+            await media_processor.send_media_group(
+                chat_id=chat_id,
+                media_paths=processed_media,
+                caption=caption,
+                thread_id=thread_id
+            )
+    
+        # Очищаем файлы
+        paths = [path for _, path in processed_media]
+        media_processor.cleanup_specific(paths)
+
     
     def _format_caption(self, item: Dict, config: Dict) -> str:
         """Форматирует caption для поста из очереди"""
