@@ -6,8 +6,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
-from handlers import router
 from keep_alive import start_keep_alive_server
+from handlers import router
 
 # Настройка логирования
 logging.basicConfig(
@@ -16,57 +16,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Загружаем .env (у тебя файл называется .env.txt)
-load_dotenv(".env.txt")
-
+# Загружаем .env (если он есть локально). На Render просто пропустится.
+load_dotenv()
 
 async def main():
     """Главная функция запуска бота"""
 
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
-        logger.error("❌ BOT_TOKEN не найден в .env.txt")
+        logger.error("❌ BOT_TOKEN не найден в переменных окружения (Render Environment Variables)")
         return
 
     bot = Bot(token=bot_token)
-    dp = Dispatcher(storage=MemoryStorage())
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
 
-    # Подключаем роутеры
     dp.include_router(router)
 
+    logger.info("🚀 Бот запущен и готов к работе!")
+
     try:
-        # Важно: если до этого был webhook — убираем
+        # Поднимаем HTTP /health (важно для Render Web Service)
+        asyncio.create_task(start_keep_alive_server())
+
+        # На всякий случай убираем вебхук и запускаем polling
         await bot.delete_webhook(drop_pending_updates=True)
-
-        # Важно: на Web Service Render ОБЯЗАН быть открыт порт
-        # Поэтому поднимаем health-сервер и убеждаемся, что он запущен
-        try:
-            await start_keep_alive_server()
-        except Exception:
-            logger.exception("❌ Не удалось запустить health-сервер (/health)")
-            raise
-
-        logger.info("🚀 Бот запущен и готов к работе!")
-        logger.info("✅ Health endpoint: /health (Render)")
-        logger.info("📋 Для остановки нажмите Ctrl+C")
-
-        # Запуск polling
         await dp.start_polling(bot)
 
     except asyncio.CancelledError:
-        logger.warning("🛑 Задача отменена (CancelledError)")
-        raise
+        logger.info("🛑 Задача отменена (CancelledError)")
     except KeyboardInterrupt:
-        logger.info("🛑 Получен сигнал остановки (KeyboardInterrupt)")
-    except Exception:
-        logger.exception("🔥 Критическая ошибка при работе бота")
+        logger.info("🛑 Получен сигнал остановки")
     finally:
         await bot.session.close()
         logger.info("👋 Бот остановлен")
 
-
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("🛑 Бот остановлен пользователем")
+    asyncio.run(main())
