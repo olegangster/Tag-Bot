@@ -1231,19 +1231,19 @@ async def batch_publish_confirmed(callback: CallbackQuery, state: FSMContext):
     
     posts = data.get('posts', [])
     category_data = data['category_data']
+    category_key = data['category_key']
     platform_id = data['platform_id']
     selected_hashtags = data.get('selected_hashtags', [])
     schedule = data.get('schedule', [])
     topic = data.get('topic')
+    time_category = data.get('time_category', 'minute')
+    time_value = data.get('time_value', 60)
     
     if not posts or not schedule:
         await callback.answer("❌ Ошибка данных", show_alert=True)
         return
     
-    await callback.message.edit_text("⏳ Запуск пакетной публикации...")
-    
-    # Запускаем пакетную публикацию
-    batch_service = BatchPostingService(MediaProcessor(callback.message.bot), callback.message.bot)
+    await callback.message.edit_text("⏳ Добавление пакета в очередь...")
     
     # Преобразуем посты в нужный формат
     posts_formatted = []
@@ -1251,20 +1251,42 @@ async def batch_publish_confirmed(callback: CallbackQuery, state: FSMContext):
         post_media = [(mtype, fid) for mtype, fid, _ in post]
         posts_formatted.append(post_media)
     
-    scheduled_count = await batch_service.schedule_batch(
-        posts=posts_formatted,
+    # Преобразуем schedule в datetime если нужно
+    schedule_dt = []
+    for s in schedule:
+        if isinstance(s, str):
+            schedule_dt.append(datetime.fromisoformat(s))
+        elif isinstance(s, datetime):
+            schedule_dt.append(s)
+        else:
+            schedule_dt.append(s)
+    
+    # Добавляем пакет в очередь
+    batch_id = queue_mgr.add_batch_to_queue(
+        user_id=callback.from_user.id,
         category_data=category_data,
+        category_key=category_key,
         platform_id=platform_id,
-        hashtags=selected_hashtags,
-        schedule=schedule,
-        thread_id=topic
+        posts=posts_formatted,
+        selected_hashtags=selected_hashtags,
+        schedule=schedule_dt,
+        topic=topic,
+        time_period=time_category,
+        time_value=time_value
     )
     
+    # Запускаем очередь если она еще не запущена
+    media_proc = MediaProcessor(callback.message.bot)
+    if not queue_mgr.running:
+        await queue_mgr.start_queue(media_proc, callback.message.bot)
+    
     await callback.message.edit_text(
-        f"✅ Пакетная публикация запущена!\n\n"
-        f"📊 Запланировано постов: <b>{scheduled_count}</b>\n"
-        f"🕐 Первый пост опубликован сейчас\n"
-        f"🕐 Последний пост: <b>{schedule[-1].strftime('%d.%m %H:%M')}</b>",
+        f"✅ Пакет добавлен в очередь!\n\n"
+        f"📦 ID пакета: <b>#{batch_id[:4]}</b>\n"
+        f"📊 Постов в пакете: <b>{len(posts)}</b>\n"
+        f"🕐 Первый пост: <b>{schedule_dt[0].strftime('%d.%m %H:%M')}</b>\n"
+        f"🕐 Последний пост: <b>{schedule_dt[-1].strftime('%d.%m %H:%M')}</b>\n\n"
+        f"Проверьте статус в разделе 📥 Очередь",
         parse_mode='HTML'
     )
     
