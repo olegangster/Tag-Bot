@@ -11,9 +11,12 @@ from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo
 
 logger = logging.getLogger(__name__)
 
+BASE_DIR = Path(__file__).resolve().parent
+
 
 def load_config() -> dict:
-    with open("config.json", "r", encoding="utf-8") as f:
+    cfg_path = BASE_DIR / "config.json"
+    with open(cfg_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -42,8 +45,14 @@ class MediaProcessor:
             bot = None
 
         self.bot = bot
-        self.temp_dir = Path(temp_dir)
-        self.temp_dir.mkdir(exist_ok=True)
+
+        # temp_dir относительно папки проекта
+        td = Path(temp_dir)
+        if not td.is_absolute():
+            td = BASE_DIR / td
+        self.temp_dir = td
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+
         self.config = load_config()
 
     # ------------------------ WATERMARK PHOTO ------------------------
@@ -56,8 +65,11 @@ class MediaProcessor:
                 return file_path
 
             watermark_path = Path(wm_cfg.get("image_path", "watermark.png"))
+            if not watermark_path.is_absolute():
+                watermark_path = BASE_DIR / watermark_path
+
             if not watermark_path.exists():
-                logger.warning(f"Watermark не найден: {watermark_path}")
+                logger.warning(f"Watermark не найден: {watermark_path.resolve()}")
                 return file_path
 
             image = Image.open(file_path).convert("RGBA")
@@ -84,8 +96,21 @@ class MediaProcessor:
             watermark.putalpha(alpha)
 
             padding = int(wm_cfg.get("padding", 20))
-            x = image_w - new_w - padding
-            y = image_h - new_h - padding
+            pos = wm_cfg.get("position", "bottom_right")
+
+            if pos == "bottom_right":
+                x = image_w - new_w - padding
+                y = image_h - new_h - padding
+            elif pos == "bottom_left":
+                x = padding
+                y = image_h - new_h - padding
+            elif pos == "top_right":
+                x = image_w - new_w - padding
+                y = padding
+            else:  # top_left
+                x = padding
+                y = padding
+
             x = max(0, x)
             y = max(0, y)
 
@@ -98,7 +123,7 @@ class MediaProcessor:
             return output_path
 
         except Exception as e:
-            logger.error(f"Ошибка watermark на фото: {e}")
+            logger.exception(f"Ошибка watermark на фото: {e}")
             return file_path
 
     # ------------------------ WATERMARK VIDEO ------------------------
@@ -106,7 +131,11 @@ class MediaProcessor:
     async def add_video_watermark(self, file_path: Path) -> Path:
         """
         Добавляет водяной знак на видео через ffmpeg.
-        ФИКС: watermark масштабируется от ШИРИНЫ ВИДЕО (scale2ref), а не от ширины картинки watermark.
+        Исправления:
+        - watermark масштабируется от ширины ВИДЕО (ref_w)
+        - аудио делаем опциональным: -map 0:a?
+        - кодируем аудио в aac (стабильнее), чтобы не падало на разных дорожках
+        - нормальное логирование ошибки
         """
         try:
             wm_cfg = self.config.get("watermark", {})
@@ -114,13 +143,15 @@ class MediaProcessor:
                 return file_path
 
             watermark_path = Path(wm_cfg.get("image_path", "watermark.png"))
+            if not watermark_path.is_absolute():
+                watermark_path = BASE_DIR / watermark_path
+
             if not watermark_path.exists():
-                logger.warning(f"Watermark не найден: {watermark_path}")
+                logger.warning(f"Watermark не найден: {watermark_path.resolve()}")
                 return file_path
 
             output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}.mp4"
 
-            # Берём scale_video, иначе scale, иначе дефолт
             scale = wm_cfg.get("scale_video", wm_cfg.get("scale", 0.10))
             scale = max(0.01, min(float(scale), 0.9))
 
@@ -128,28 +159,44 @@ class MediaProcessor:
             opacity = max(0.0, min(opacity, 1.0))
 
             padding = int(wm_cfg.get("padding", 20))
+            pos = wm_cfg.get("position", "bottom_right")
 
-            # scale2ref:
-            # [wmrgba][base] -> [wm][base]
-            # w=ow*scale  (ow = ширина base видео)
+            if pos == "bottom_right":
+                ox, oy = f"W-w-{padding}", f"H-h-{padding}"
+            elif pos == "bottom_left":
+                ox, oy = f"{padding}", f"H-h-{padding}"
+            elif pos == "top_right":
+                ox, oy = f"W-w-{padding}", f"{padding}"
+            else:
+                ox, oy = f"{padding}", f"{padding}"
+
+            # ref_w/ref_h — размеры видео (reference), watermark масштабируем от ref_w
             filter_complex = (
                 f"[1:v]format=rgba,colorchannelmixer=aa={opacity}[wmrgba];"
-                f"[wmrgba][0:v]scale2ref=w=ow*{scale}:h=ow*{scale}*ih/iw[wm][base];"
-                f"[base][wm]overlay=W-w-{padding}:H-h-{padding}:format=auto,format=yuv420p"
+                f"[wmrgba][0:v]scale2ref=w=ref_w*{scale}:h=-1[wm][base];"
+                f"[base][wm]overlay={ox}:{oy}:format=auto,format=yuv420p[v]"
             )
 
             cmd = [
                 "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
                 "-y",
                 "-i", str(file_path),
                 "-i", str(watermark_path),
                 "-filter_complex", filter_complex,
+                "-map", "[v]",
+                "-map", "0:a?",            # <-- аудио опционально (важно!)
                 "-c:v", "libx264",
-                "-preset", "ultrafast",
+                "-preset", "veryfast",
                 "-crf", "23",
-                "-c:a", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
                 str(output_path),
             ]
+
+            logger.info(f"FFmpeg CMD: {' '.join(cmd)}")
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -158,15 +205,19 @@ class MediaProcessor:
             )
             stdout, stderr = await process.communicate()
 
-            if process.returncode == 0:
+            if process.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
                 logger.info(f"✅ Видео watermark применен (scale_video={scale}, opacity={opacity})")
                 return output_path
 
-            logger.error(f"FFmpeg error:\n{stderr.decode(errors='ignore')}")
+            err = stderr.decode(errors="ignore").strip()
+            logger.error(f"❌ FFmpeg error (code={process.returncode}):\n{err}")
             return file_path
 
+        except FileNotFoundError:
+            logger.error("❌ FFmpeg не найден на сервере (команда ffmpeg отсутствует).")
+            return file_path
         except Exception as e:
-            logger.error(f"Ошибка watermark на видео: {e}")
+            logger.exception(f"Ошибка watermark на видео: {e}")
             return file_path
 
     # ------------------------ DOWNLOAD + PROCESS ------------------------
@@ -194,7 +245,7 @@ class MediaProcessor:
             return media_type, processed
 
         except Exception as e:
-            logger.error(f"Ошибка обработки медиа: {e}")
+            logger.exception(f"Ошибка обработки медиа: {e}")
             return None
 
     async def process_batch(self, media_list: List[Tuple[str, str]]) -> List[Tuple[str, Path]]:
@@ -256,7 +307,7 @@ class MediaProcessor:
             return True
 
         except Exception as e:
-            logger.error(f"Ошибка отправки медиа-группы: {e}")
+            logger.exception(f"Ошибка отправки медиа-группы: {e}")
             return False
 
     async def send_single_media(
@@ -292,7 +343,7 @@ class MediaProcessor:
             return True
 
         except Exception as e:
-            logger.error(f"Ошибка отправки одиночного медиа: {e}")
+            logger.exception(f"Ошибка отправки одиночного медиа: {e}")
             return False
 
     # ------------------------ CLEANUP ------------------------
@@ -304,7 +355,7 @@ class MediaProcessor:
                 if file.is_file():
                     file.unlink()
         except Exception as e:
-            logger.error(f"Ошибка очистки временных файлов: {e}")
+            logger.exception(f"Ошибка очистки временных файлов: {e}")
 
     def cleanup_specific(self, paths: List[Path]):
         """Очищает конкретные файлы"""
