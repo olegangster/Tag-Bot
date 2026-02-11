@@ -133,50 +133,52 @@ class MediaProcessor:
         Добавляет водяной знак на видео через ffmpeg.
         Исправления:
         - watermark масштабируется от ширины ВИДЕО (ref_w)
-        - аудио делаем опциональным: -map 0:a?
-        - кодируем аудио в aac (стабильнее), чтобы не падало на разных дорожках
-        - нормальное логирование ошибки
+        - корректные метки [v] для -map
+        - позиция учитывается (top/bottom left/right)
+        - аудио опционально: -map 0:a?
+        - аудио перекодируем в aac (стабильнее)
         """
         try:
             wm_cfg = self.config.get("watermark", {})
             if not wm_cfg.get("enabled", False):
                 return file_path
-
+    
             watermark_path = Path(wm_cfg.get("image_path", "watermark.png"))
             if not watermark_path.is_absolute():
                 watermark_path = BASE_DIR / watermark_path
-
+    
             if not watermark_path.exists():
                 logger.warning(f"Watermark не найден: {watermark_path.resolve()}")
                 return file_path
-
+    
             output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}.mp4"
-
+    
             scale = wm_cfg.get("scale_video", wm_cfg.get("scale", 0.10))
             scale = max(0.01, min(float(scale), 0.9))
-
+    
             opacity = float(wm_cfg.get("opacity", 0.7))
             opacity = max(0.0, min(opacity, 1.0))
-
+    
             padding = int(wm_cfg.get("padding", 20))
             pos = wm_cfg.get("position", "bottom_right")
-
+    
             if pos == "bottom_right":
                 ox, oy = f"W-w-{padding}", f"H-h-{padding}"
             elif pos == "bottom_left":
                 ox, oy = f"{padding}", f"H-h-{padding}"
             elif pos == "top_right":
                 ox, oy = f"W-w-{padding}", f"{padding}"
-            else:
+            else:  # top_left
                 ox, oy = f"{padding}", f"{padding}"
-
-            # ref_w/ref_h — размеры видео (reference), watermark масштабируем от ref_w
+    
+            # ВАЖНО: scale2ref использует ref_w/ref_h для reference (видео)
+            # и обязательно ставим метку [v] на выходе фильтра, раз мы делаем -map [v]
             filter_complex = (
                 f"[1:v]format=rgba,colorchannelmixer=aa={opacity}[wmrgba];"
                 f"[wmrgba][0:v]scale2ref=w=ref_w*{scale}:h=-1[wm][base];"
-                f"[base][wm]overlay={ox}:{oy}:format=auto,format=yuv420p[v]"
+                f"[base][wm]overlay=x={ox}:y={oy}:format=auto,format=yuv420p[v]"
             )
-
+    
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
@@ -186,7 +188,7 @@ class MediaProcessor:
                 "-i", str(watermark_path),
                 "-filter_complex", filter_complex,
                 "-map", "[v]",
-                "-map", "0:a?",            # <-- аудио опционально (важно!)
+                "-map", "0:a?",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "23",
@@ -195,30 +197,29 @@ class MediaProcessor:
                 "-movflags", "+faststart",
                 str(output_path),
             ]
-
-            logger.info(f"FFmpeg CMD: {' '.join(cmd)}")
-
+    
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await process.communicate()
-
+            _, stderr = await process.communicate()
+    
             if process.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
                 logger.info(f"✅ Видео watermark применен (scale_video={scale}, opacity={opacity})")
                 return output_path
-
+    
             err = stderr.decode(errors="ignore").strip()
             logger.error(f"❌ FFmpeg error (code={process.returncode}):\n{err}")
             return file_path
-
+    
         except FileNotFoundError:
             logger.error("❌ FFmpeg не найден на сервере (команда ffmpeg отсутствует).")
             return file_path
         except Exception as e:
             logger.exception(f"Ошибка watermark на видео: {e}")
             return file_path
+
 
     # ------------------------ DOWNLOAD + PROCESS ------------------------
 
