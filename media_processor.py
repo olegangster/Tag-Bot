@@ -4,21 +4,17 @@ import json
 import uuid
 from pathlib import Path
 from typing import List, Tuple, Optional, Union
-
 from PIL import Image
 from aiogram import Bot as AiogramBot
 from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo
 
 logger = logging.getLogger(__name__)
-
 BASE_DIR = Path(__file__).resolve().parent
-
 
 def load_config() -> dict:
     cfg_path = BASE_DIR / "config.json"
     with open(cfg_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
 
 class MediaProcessor:
     """
@@ -55,7 +51,6 @@ class MediaProcessor:
         self.config = load_config()
 
     # ------------------------ WATERMARK PHOTO ------------------------
-
     async def add_photo_watermark(self, file_path: Path) -> Path:
         try:
             wm_cfg = self.config.get("watermark", {})
@@ -104,7 +99,7 @@ class MediaProcessor:
             elif pos == "top_right":
                 x = image_w - new_w - padding
                 y = padding
-            else:  # top_left
+            else: # top_left
                 x = padding
                 y = padding
 
@@ -124,7 +119,6 @@ class MediaProcessor:
             return file_path
 
     # ------------------------ WATERMARK VIDEO ------------------------
-
     async def add_video_watermark(self, file_path: Path) -> Path:
         """
         FIX для ffmpeg (ваша версия):
@@ -216,7 +210,6 @@ class MediaProcessor:
             return file_path
 
     # ------------------------ DOWNLOAD + PROCESS ------------------------
-
     async def download_and_process(self, media_type: str, file_id: str) -> Optional[Tuple[str, Path]]:
         try:
             if not self.bot:
@@ -260,7 +253,6 @@ class MediaProcessor:
         return processed
 
     # ------------------------ SEND MEDIA ------------------------
-
     async def send_media_group(
         self,
         chat_id: int,
@@ -338,7 +330,6 @@ class MediaProcessor:
             return False
 
     # ------------------------ CLEANUP ------------------------
-
     def cleanup(self):
         try:
             for file in self.temp_dir.glob("*"):
