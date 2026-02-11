@@ -170,11 +170,14 @@ class MediaProcessor:
             else:
                 overlay_pos = f"{padding}:{padding}"
 
-            # ✅ ПРОСТАЯ И БЫСТРАЯ команда ffmpeg
+            # ✅ RENDER-ОПТИМИЗИРОВАННАЯ команда ffmpeg
+            # Сначала уменьшаем видео до max 720px ширины (в 4x меньше пикселей → в 4x быстрее)
+            # -2 вместо -1 чтобы размеры были чётными (требование libx264)
             filter_complex = (
-                f"[1:v]scale=iw*{scale}:-1,format=rgba,"
+                f"[0:v]scale='min(720,iw)':-2[scaled];"
+                f"[1:v]scale=iw*{scale}:-2,format=rgba,"
                 f"colorchannelmixer=aa={opacity}[wm];"
-                f"[0:v][wm]overlay={overlay_pos}:format=auto"
+                f"[scaled][wm]overlay={overlay_pos}:format=auto"
             )
 
             cmd = [
@@ -186,16 +189,16 @@ class MediaProcessor:
                 "-i", str(watermark_path),
                 "-filter_complex", filter_complex,
                 "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "23",
+                "-preset", "ultrafast",
+                "-crf", "28",
                 "-c:a", "copy",
                 "-movflags", "+faststart",
                 str(output_path),
             ]
 
-            logger.info(f"🎬 FFmpeg: scale={scale:.2f}, opacity={opacity:.2f}")
+            logger.info(f"🎬 FFmpeg (Render): scale={scale:.2f}, opacity={opacity:.2f}, preset=ultrafast, max_w=720px")
 
-            # ✅ ЗАПУСКАЕМ С ТАЙМАУТОМ 60 СЕКУНД
+            # ✅ ТАЙМАУТ 5 МИНУТ (Render.com медленный, нужно больше времени)
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -203,14 +206,13 @@ class MediaProcessor:
             )
             
             try:
-                # ✅ ВАЖНО: Ждем максимум 60 секунд!
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=60.0
+                    timeout=300.0  # ← 5 минут вместо 60 секунд
                 )
             except asyncio.TimeoutError:
                 process.kill()
-                logger.error("❌ FFmpeg таймаут (>60 сек) - используем оригинал")
+                logger.error("❌ FFmpeg таймаут (>5 мин) - используем оригинал")
                 return file_path
 
             # Проверяем результат
