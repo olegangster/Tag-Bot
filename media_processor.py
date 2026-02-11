@@ -10,104 +10,119 @@ import uuid   # ← добавлено для уникальных имён фа
 
 logger = logging.getLogger(__name__)
 
+
 def load_config():
     with open('config.json', 'r', encoding='utf-8') as f:
         return json.load(f)
 
+
 class MediaProcessor:
-    """
-    Процессор медиа с водяными знаками
-    
-    РЕШЕНИЕ ЗАДАЧИ 2: Динамический размер водяного знака
-    """
-    
-    def __init__(self, bot: Bot):
-        self.bot = bot
-        self.temp_dir = Path("temp_media")
+    def __init__(self, temp_dir: str = "temp"):
+        self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(exist_ok=True)
         self.config = load_config()
-    
-    async def add_photo_watermark(self, file_path: Path) -> Path:
-        """
-        Добавляет водяной знак на фото с ДИНАМИЧЕСКИМ размером
-        """
+
+    def cleanup_temp_files(self):
+        """Очищает временные файлы"""
+        try:
+            for file in self.temp_dir.glob("*"):
+                if file.is_file():
+                    file.unlink()
+        except Exception as e:
+            logger.error(f"Ошибка очистки temp файлов: {e}")
+
+    def cleanup_specific(self, file_paths: List[Path]):
+        """Очищает конкретные файлы"""
+        try:
+            for file_path in file_paths:
+                if file_path.exists():
+                    file_path.unlink()
+        except Exception as e:
+            logger.error(f"Ошибка очистки файлов: {e}")
+
+    async def download_file(self, file_id: str, bot: Bot) -> Optional[Path]:
+        """Скачивает файл по file_id"""
+        try:
+            file = await bot.get_file(file_id)
+            file_path = self.temp_dir / f"{file_id}_{uuid.uuid4().hex}"
+
+            await bot.download_file(file.file_path, destination=file_path)
+            return file_path
+        except Exception as e:
+            logger.error(f"Ошибка скачивания файла: {e}")
+            return None
+
+    def add_watermark(self, file_path: Path) -> Path:
+        """Добавляет водяной знак на фото через PIL"""
         try:
             if not self.config['watermark']['enabled']:
                 return file_path
-            
+
             watermark_path = Path(self.config['watermark']['image_path'])
             if not watermark_path.exists():
-                logger.warning(f"Watermark не найден: {watermark_path}")
                 return file_path
-            
-            image = Image.open(file_path).convert("RGBA")
-            watermark = Image.open(watermark_path).convert("RGBA")
-            
-            image_width, image_height = image.size
-            scale = self.config['watermark'].get('scale_photo', self.config['watermark'].get('scale', 0.15))
-            wm_new_width = int(image_width * scale)
-            wm_original_width, wm_original_height = watermark.size
-            aspect_ratio = wm_original_height / wm_original_width
-            wm_new_height = int(wm_new_width * aspect_ratio)
-            
-            watermark_resized = watermark.resize(
-                (wm_new_width, wm_new_height), 
-                Image.Resampling.LANCZOS
-            )
-            
-            logger.info(
-                f"Watermark масштабирован: {wm_original_width}x{wm_original_height} → "
-                f"{wm_new_width}x{wm_new_height} для изображения {image_width}x{image_height}"
-            )
-            
-            opacity = self.config['watermark'].get('opacity', 0.7)
-            alpha = watermark_resized.split()[3]
-            alpha = alpha.point(lambda p: int(p * opacity * 255 / 255))
-            watermark_resized.putalpha(alpha)
-            
-            padding = self.config['watermark'].get('padding', 20)
-            position = (
-                image_width - wm_new_width - padding,
-                image_height - wm_new_height - padding
-            )
-            
-            transparent_layer = Image.new('RGBA', image.size, (0, 0, 0, 0))
-            transparent_layer.paste(watermark_resized, position)
-            watermarked = Image.alpha_composite(image, transparent_layer)
-            
-            output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}.jpg"
-            watermarked.convert("RGB").save(output_path, "JPEG", quality=95, optimize=True)
-            
+
+            output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}{file_path.suffix}"
+
+            with Image.open(file_path).convert("RGBA") as base_image:
+                with Image.open(watermark_path).convert("RGBA") as watermark:
+                    # Масштабирование ватермарки
+                    scale_percent = self.config['watermark'].get('scale_image', self.config['watermark'].get('scale', 0.15))
+                    new_width = int(base_image.width * scale_percent)
+                    ratio = new_width / watermark.width
+                    new_height = int(watermark.height * ratio)
+                    watermark = watermark.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+                    # Прозрачность
+                    opacity = self.config['watermark'].get('opacity', 0.7)
+                    alpha = watermark.split()[3]
+                    alpha = alpha.point(lambda p: int(p * opacity))
+                    watermark.putalpha(alpha)
+
+                    # Позиция
+                    padding = self.config['watermark'].get('padding', 20)
+                    x = base_image.width - watermark.width - padding
+                    y = base_image.height - watermark.height - padding
+
+                    base_image.paste(watermark, (x, y), watermark)
+                    base_image.convert("RGB").save(output_path, quality=95)
+
             return output_path
-            
+
         except Exception as e:
             logger.error(f"Ошибка watermark на фото: {e}")
             return file_path
-    
+
     async def add_video_watermark(self, file_path: Path) -> Path:
         """
         Добавляет водяной знак на видео через ffmpeg с ДИНАМИЧЕСКИМ размером
+        (ватермарка масштабируется от размера ВИДЕО, а не от размера картинки ватермарки)
         """
         try:
             if not self.config['watermark']['enabled']:
                 return file_path
-            
+
             watermark_path = Path(self.config['watermark']['image_path'])
             if not watermark_path.exists():
                 return file_path
-            
+
             output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}.mp4"
-            
+
+            # ВАЖНО: scale_video — доля от ширины видео (например 0.08 = 8% ширины видео)
             scale_percent = self.config['watermark'].get('scale_video', self.config['watermark'].get('scale', 0.15))
             padding = self.config['watermark'].get('padding', 20)
-            
+            opacity = self.config['watermark'].get('opacity', 0.7)
+
             cmd = [
                 'ffmpeg',
                 '-i', str(file_path),
                 '-i', str(watermark_path),
                 '-filter_complex',
-                f'[1:v]scale=iw*{scale_percent}:-1[wm];'
-                f'[0:v][wm]overlay=W-w-{padding}:H-h-{padding}:format=auto,format=yuv420p',
+                (
+                    f'[1:v]format=rgba,colorchannelmixer=aa={opacity}[wmrgba];'
+                    f'[wmrgba][0:v]scale2ref=w=ow*{scale_percent}:h=ow*{scale_percent}*ih/iw[wm][base];'
+                    f'[base][wm]overlay=W-w-{padding}:H-h-{padding}:format=auto,format=yuv420p'
+                ),
                 '-c:a', 'copy',
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
@@ -115,158 +130,157 @@ class MediaProcessor:
                 '-y',
                 str(output_path)
             ]
-            
+
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            
+
             stdout, stderr = await process.communicate()
-            
+
             if process.returncode == 0:
                 logger.info(f"Видео watermark успешно применен с масштабом {scale_percent*100}%")
                 return output_path
             else:
                 logger.error(f"FFmpeg error: {stderr.decode()}")
                 return file_path
-                
+
         except Exception as e:
             logger.error(f"Ошибка watermark на видео: {e}")
             return file_path
-    
-    async def download_and_process(self, media_type: str, file_id: str) -> Tuple[str, Path]:
-        """Скачивает и обрабатывает один файл — теперь с уникальным именем"""
+
+    async def download_and_process(self, media_type: str, file_id: str, bot: Bot) -> Optional[Tuple[str, Path]]:
+        """Скачивает и обрабатывает медиа файл"""
+        file_path = await self.download_file(file_id, bot)
+        if not file_path:
+            return None
+
         try:
-            file = await self.bot.get_file(file_id)
-            file_bytes = await self.bot.download_file(file.file_path)
-            
-            ext = 'jpg' if media_type == 'photo' else 'mp4'
-            # Уникальное имя файла — решает проблему дублирования из альбома
-            temp_path = self.temp_dir / f"{uuid.uuid4().hex}.{ext}"
-            
-            with open(temp_path, 'wb') as f:
-                f.write(file_bytes.read())
-            
+            # Определяем расширение файла
+            file_extension = Path(file_path).suffix.lower()
+
+            # Если файл без расширения, пытаемся определить по типу
+            if not file_extension:
+                if media_type == 'photo':
+                    file_path_with_ext = file_path.with_suffix('.jpg')
+                    file_path.rename(file_path_with_ext)
+                    file_path = file_path_with_ext
+                elif media_type == 'video':
+                    file_path_with_ext = file_path.with_suffix('.mp4')
+                    file_path.rename(file_path_with_ext)
+                    file_path = file_path_with_ext
+
+            # Применяем watermark
             if media_type == 'photo':
-                processed_path = await self.add_photo_watermark(temp_path)
+                processed_path = self.add_watermark(file_path)
+            elif media_type == 'video':
+                processed_path = await self.add_video_watermark(file_path)
             else:
-                processed_path = await self.add_video_watermark(temp_path)
-            
-            return media_type, processed_path
-            
+                processed_path = file_path
+
+            return (media_type, processed_path)
+
         except Exception as e:
             logger.error(f"Ошибка обработки медиа: {e}")
-            return None, None
-    
-    async def process_batch(self, media_list: List[Tuple[str, str]]) -> List[Tuple[str, Path]]:
-        """Параллельная обработка пакета медиа"""
-        tasks = [
-            self.download_and_process(media_type, file_id) 
-            for media_type, file_id in media_list
-        ]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        processed = [
-            (mtype, path) for mtype, path in results 
-            if isinstance(mtype, str) and path is not None
-        ]
-        
-        return processed
-    
-    async def send_media_group(self, chat_id: int, media_paths: List[Tuple[str, Path]], 
-                              caption: str = None, thread_id: int = None) -> bool:
-        """Отправляет медиа-группу"""
+            return (media_type, file_path)
+
+    async def process_batch(self, media_files: List[dict], bot: Bot = None) -> List[Tuple[str, Path]]:
+        """Обрабатывает пачку медиа файлов"""
+        processed_files = []
+
+        for media in media_files:
+            try:
+                media_type = media.get('type')
+                file_id = media.get('file_id')
+
+                if bot and file_id:
+                    processed = await self.download_and_process(media_type, file_id, bot)
+                    if processed:
+                        processed_files.append(processed)
+
+            except Exception as e:
+                logger.error(f"Ошибка обработки файла в batch: {e}")
+                continue
+
+        return processed_files
+
+    async def send_single_media(
+        self,
+        chat_id: int,
+        media_type: str,
+        file_path: Path,
+        caption: str,
+        thread_id: Optional[int] = None,
+        bot: Optional[Bot] = None
+    ):
+        """Отправляет один медиа файл"""
         try:
-            media_group = []
-            
-            for i, (media_type, file_path) in enumerate(media_paths):
-                if media_type == 'photo':
-                    media = InputMediaPhoto(
-                        media=FSInputFile(file_path),
-                        caption=caption if i == 0 else None,
-                        parse_mode='HTML'
-                    )
-                else:
-                    media = InputMediaVideo(
-                        media=FSInputFile(file_path),
-                        caption=caption if i == 0 else None,
-                        parse_mode='HTML'
-                    )
-                media_group.append(media)
-            
-            if thread_id:
-                await self.bot.send_media_group(
-                    chat_id=chat_id, 
-                    media=media_group,
+            if not bot:
+                raise ValueError("Bot instance is required")
+
+            input_file = FSInputFile(file_path)
+
+            if media_type == 'photo':
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=input_file,
+                    caption=caption,
+                    parse_mode='HTML',
                     message_thread_id=thread_id
                 )
-            else:
-                await self.bot.send_media_group(chat_id=chat_id, media=media_group)
-            
-            return True
-            
+            elif media_type == 'video':
+                await bot.send_video(
+                    chat_id=chat_id,
+                    video=input_file,
+                    caption=caption,
+                    parse_mode='HTML',
+                    message_thread_id=thread_id
+                )
+
         except Exception as e:
-            logger.error(f"Ошибка отправки медиа-группы: {e}")
-            return False
-    
-    async def send_single_media(self, chat_id: int, media_type: str, 
-                               file_path: Path, caption: str = None,
-                               thread_id: int = None) -> bool:
-        """Отправляет один медиафайл"""
+            logger.error(f"Ошибка отправки медиа: {e}")
+
+    async def send_media_group(
+        self,
+        chat_id: int,
+        media_paths: List[Tuple[str, Path]],
+        caption: str,
+        thread_id: Optional[int] = None,
+        bot: Optional[Bot] = None
+    ):
+        """Отправляет группу медиа файлов"""
         try:
-            if media_type == 'photo':
-                if thread_id:
-                    await self.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=FSInputFile(file_path),
-                        caption=caption,
-                        parse_mode='HTML',
-                        message_thread_id=thread_id
+            if not bot:
+                raise ValueError("Bot instance is required")
+
+            media_group = []
+
+            for i, (media_type, file_path) in enumerate(media_paths):
+                input_file = FSInputFile(file_path)
+
+                if media_type == 'photo':
+                    media_group.append(
+                        InputMediaPhoto(
+                            media=input_file,
+                            caption=caption if i == 0 else None,
+                            parse_mode='HTML' if i == 0 else None
+                        )
                     )
-                else:
-                    await self.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=FSInputFile(file_path),
-                        caption=caption,
-                        parse_mode='HTML'
+                elif media_type == 'video':
+                    media_group.append(
+                        InputMediaVideo(
+                            media=input_file,
+                            caption=caption if i == 0 else None,
+                            parse_mode='HTML' if i == 0 else None
+                        )
                     )
-            else:
-                if thread_id:
-                    await self.bot.send_video(
-                        chat_id=chat_id,
-                        video=FSInputFile(file_path),
-                        caption=caption,
-                        parse_mode='HTML',
-                        message_thread_id=thread_id
-                    )
-                else:
-                    await self.bot.send_video(
-                        chat_id=chat_id,
-                        video=FSInputFile(file_path),
-                        caption=caption,
-                        parse_mode='HTML'
-                    )
-            return True
+
+            await bot.send_media_group(
+                chat_id=chat_id,
+                media=media_group,
+                message_thread_id=thread_id
+            )
+
         except Exception as e:
-            logger.error(f"Ошибка отправки одиночного медиа: {e}")
-            return False
-    
-    def cleanup(self):
-        """Очищает временные файлы"""
-        try:
-            for file in self.temp_dir.glob("*"):
-                if file.is_file():
-                    file.unlink()
-        except Exception as e:
-            logger.error(f"Ошибка очистки временных файлов: {e}")
-    
-    def cleanup_specific(self, paths: List[Path]):
-        """Очищает конкретные файлы"""
-        for path in paths:
-            try:
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
+            logger.error(f"Ошибка отправки media group: {e}")
