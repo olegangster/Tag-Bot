@@ -18,16 +18,14 @@ def load_config() -> dict:
 
 class MediaProcessor:
     """
-    Процессор медиа:
-    - скачивает файлы
-    - добавляет watermark на фото (PIL)
-    - добавляет watermark на видео (ffmpeg)
-    - отправляет single/group медиа
-
-    Совместимость:
-      MediaProcessor(message.bot)
-      MediaProcessor(bot=message.bot)
-      MediaProcessor("temp_dir")
+    ✅ ULTRA FIXED VERSION
+    
+    Исправления:
+    1. ✅ Таймаут 60 секунд для ffmpeg
+    2. ✅ Простая команда overlay (без scale2ref)
+    3. ✅ Увеличенный watermark (0.25 вместо 0.10)
+    4. ✅ Fallback на оригинал при любых ошибках
+    5. ✅ Подробное логирование
     """
 
     def __init__(
@@ -35,7 +33,6 @@ class MediaProcessor:
         bot: Optional[AiogramBot] = None,
         temp_dir: Union[str, Path] = "temp_media",
     ):
-        # если кто-то случайно передал temp_dir первым аргументом
         if bot is not None and not isinstance(bot, AiogramBot) and isinstance(bot, (str, Path)):
             temp_dir = bot
             bot = None
@@ -50,8 +47,9 @@ class MediaProcessor:
 
         self.config = load_config()
 
-    # ------------------------ WATERMARK PHOTO ------------------------
+    # ======================== WATERMARK PHOTO ========================
     async def add_photo_watermark(self, file_path: Path) -> Path:
+        """Быстрый watermark на фото через PIL"""
         try:
             wm_cfg = self.config.get("watermark", {})
             if not wm_cfg.get("enabled", False):
@@ -62,16 +60,18 @@ class MediaProcessor:
                 watermark_path = BASE_DIR / watermark_path
 
             if not watermark_path.exists():
-                logger.warning(f"Watermark не найден: {watermark_path.resolve()}")
+                logger.warning(f"❌ Watermark не найден: {watermark_path}")
                 return file_path
 
+            # Открываем изображения
             image = Image.open(file_path).convert("RGBA")
             watermark = Image.open(watermark_path).convert("RGBA")
 
             image_w, image_h = image.size
 
-            scale = wm_cfg.get("scale_photo", wm_cfg.get("scale", 0.12))
-            scale = max(0.01, min(float(scale), 0.9))
+            # Размер watermark - УВЕЛИЧЕН!
+            scale = wm_cfg.get("scale_photo", wm_cfg.get("scale", 0.20))  # 20% вместо 12%
+            scale = max(0.05, min(float(scale), 0.9))
 
             new_w = max(1, int(image_w * scale))
             wm_w, wm_h = watermark.size
@@ -80,13 +80,15 @@ class MediaProcessor:
 
             watermark = watermark.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
-            opacity = float(wm_cfg.get("opacity", 0.7))
+            # Прозрачность
+            opacity = float(wm_cfg.get("opacity", 0.8))  # 0.8 вместо 0.7
             opacity = max(0.0, min(opacity, 1.0))
 
             alpha = watermark.split()[3]
             alpha = alpha.point(lambda p: int(p * opacity))
             watermark.putalpha(alpha)
 
+            # Позиция
             padding = int(wm_cfg.get("padding", 20))
             pos = wm_cfg.get("position", "bottom_right")
 
@@ -99,31 +101,39 @@ class MediaProcessor:
             elif pos == "top_right":
                 x = image_w - new_w - padding
                 y = padding
-            else: # top_left
+            else:
                 x = padding
                 y = padding
 
             x = max(0, x)
             y = max(0, y)
 
+            # Накладываем
             layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
             layer.paste(watermark, (x, y), watermark)
             out = Image.alpha_composite(image, layer)
 
+            # Сохраняем
             output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}.jpg"
             out.convert("RGB").save(output_path, "JPEG", quality=95, optimize=True)
+            
+            logger.info(f"✅ Фото watermark: scale={scale:.2f}, opacity={opacity:.2f}")
             return output_path
 
         except Exception as e:
-            logger.exception(f"Ошибка watermark на фото: {e}")
+            logger.error(f"❌ Ошибка watermark фото: {e}")
             return file_path
 
-    # ------------------------ WATERMARK VIDEO ------------------------
+    # ======================== WATERMARK VIDEO ========================
     async def add_video_watermark(self, file_path: Path) -> Path:
         """
-        FIX для ffmpeg (ваша версия):
-        - В scale2ref НЕ использовать ref_w/ref_h и НЕ использовать ow
-        - Масштабируем watermark от ширины reference-видео через iw (в scale2ref это ширина reference)
+        ✅ ИСПРАВЛЕННАЯ версия для видео
+        
+        Изменения:
+        1. Простая команда overlay (без scale2ref)
+        2. Таймаут 60 секунд
+        3. Увеличенный watermark (25% вместо 10%)
+        4. Fallback на оригинал
         """
         try:
             wm_cfg = self.config.get("watermark", {})
@@ -135,86 +145,101 @@ class MediaProcessor:
                 watermark_path = BASE_DIR / watermark_path
 
             if not watermark_path.exists():
-                logger.warning(f"Watermark не найден: {watermark_path.resolve()}")
+                logger.warning(f"❌ Watermark не найден: {watermark_path}")
                 return file_path
 
             output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}.mp4"
 
-            scale = wm_cfg.get("scale_video", wm_cfg.get("scale", 0.10))
-            scale = max(0.01, min(float(scale), 0.9))
-
-            opacity = float(wm_cfg.get("opacity", 0.7))
+            # Параметры - УВЕЛИЧЕНЫ!
+            scale = wm_cfg.get("scale_video", wm_cfg.get("scale", 0.25))  # 25% вместо 10%
+            scale = max(0.05, min(float(scale), 0.9))
+            
+            opacity = float(wm_cfg.get("opacity", 0.8))  # 0.8 вместо 0.7
             opacity = max(0.0, min(opacity, 1.0))
-
+            
             padding = int(wm_cfg.get("padding", 20))
             pos = wm_cfg.get("position", "bottom_right")
 
+            # Позиция overlay
             if pos == "bottom_right":
-                ox, oy = f"W-w-{padding}", f"H-h-{padding}"
+                overlay_pos = f"W-w-{padding}:H-h-{padding}"
             elif pos == "bottom_left":
-                ox, oy = f"{padding}", f"H-h-{padding}"
+                overlay_pos = f"{padding}:H-h-{padding}"
             elif pos == "top_right":
-                ox, oy = f"W-w-{padding}", f"{padding}"
+                overlay_pos = f"W-w-{padding}:{padding}"
             else:
-                ox, oy = f"{padding}", f"{padding}"
+                overlay_pos = f"{padding}:{padding}"
 
-            # ВАЖНО: в scale2ref iw/ih относятся к reference (0:v), т.е. к ВИДЕО
-            # Значит watermark (1:v) масштабируем от ширины видео: iw*scale
+            # ✅ ПРОСТАЯ И БЫСТРАЯ команда ffmpeg
             filter_complex = (
-                f"[1:v]format=rgba,colorchannelmixer=aa={opacity}[wmrgba];"
-                f"[wmrgba][0:v]scale2ref=w=iw*{scale}:h=-1[wm][base];"
-                f"[base][wm]overlay={ox}:{oy}:format=auto,format=yuv420p[v]"
+                f"[1:v]scale=iw*{scale}:-1,format=rgba,"
+                f"colorchannelmixer=aa={opacity}[wm];"
+                f"[0:v][wm]overlay={overlay_pos}:format=auto"
             )
 
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
-                "-loglevel", "error",
+                "-loglevel", "warning",
                 "-y",
                 "-i", str(file_path),
                 "-i", str(watermark_path),
                 "-filter_complex", filter_complex,
-                "-map", "[v]",
-                "-map", "0:a?",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "23",
-                "-c:a", "aac",
-                "-b:a", "128k",
+                "-c:a", "copy",
                 "-movflags", "+faststart",
                 str(output_path),
             ]
 
-            logger.info(f"FFmpeg CMD: {' '.join(cmd)}")
+            logger.info(f"🎬 FFmpeg: scale={scale:.2f}, opacity={opacity:.2f}")
 
+            # ✅ ЗАПУСКАЕМ С ТАЙМАУТОМ 60 СЕКУНД
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await process.communicate()
+            
+            try:
+                # ✅ ВАЖНО: Ждем максимум 60 секунд!
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=60.0
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                logger.error("❌ FFmpeg таймаут (>60 сек) - используем оригинал")
+                return file_path
 
+            # Проверяем результат
             if process.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
-                logger.info(f"✅ Видео watermark применен (scale_video={scale}, opacity={opacity})")
+                logger.info(f"✅ Видео watermark применен успешно")
                 return output_path
 
+            # Логируем ошибку
             err = stderr.decode(errors="ignore").strip()
-            logger.error(f"❌ FFmpeg error (code={process.returncode}):\n{err}")
+            if err:
+                logger.error(f"❌ FFmpeg error (код {process.returncode}):\n{err[:500]}")
+            
             return file_path
 
         except FileNotFoundError:
-            logger.error("❌ FFmpeg не найден на сервере (команда ffmpeg отсутствует).")
+            logger.error("❌ FFmpeg не установлен на сервере")
             return file_path
         except Exception as e:
-            logger.exception(f"Ошибка watermark на видео: {e}")
+            logger.error(f"❌ Ошибка watermark видео: {e}")
             return file_path
 
-    # ------------------------ DOWNLOAD + PROCESS ------------------------
+    # ======================== DOWNLOAD + PROCESS ========================
     async def download_and_process(self, media_type: str, file_id: str) -> Optional[Tuple[str, Path]]:
+        """Скачивает и обрабатывает один файл"""
         try:
             if not self.bot:
-                raise RuntimeError("MediaProcessor: bot не передан (self.bot is None)")
+                raise RuntimeError("MediaProcessor: bot не передан")
 
+            # Скачиваем
             file = await self.bot.get_file(file_id)
             file_bytes = await self.bot.download_file(file.file_path)
 
@@ -224,6 +249,9 @@ class MediaProcessor:
             with open(temp_path, "wb") as f:
                 f.write(file_bytes.read())
 
+            logger.info(f"📥 Скачали {media_type}: {temp_path.name}")
+
+            # Обрабатываем
             if media_type == "photo":
                 processed = await self.add_photo_watermark(temp_path)
             else:
@@ -232,17 +260,20 @@ class MediaProcessor:
             return media_type, processed
 
         except Exception as e:
-            logger.exception(f"Ошибка обработки медиа: {e}")
+            logger.error(f"❌ Ошибка обработки медиа: {e}")
             return None
 
     async def process_batch(self, media_list: List[Tuple[str, str]]) -> List[Tuple[str, Path]]:
+        """Параллельная обработка пакета медиа"""
+        logger.info(f"📦 Обрабатываем {len(media_list)} файлов...")
+        
         tasks = [self.download_and_process(mtype, fid) for mtype, fid in media_list]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         processed: List[Tuple[str, Path]] = []
         for r in results:
             if isinstance(r, Exception):
-                logger.error(f"process_batch exception: {r}")
+                logger.error(f"❌ Exception: {r}")
                 continue
             if r is None:
                 continue
@@ -250,9 +281,10 @@ class MediaProcessor:
             if isinstance(mtype, str) and path is not None:
                 processed.append((mtype, path))
 
+        logger.info(f"✅ Обработано {len(processed)}/{len(media_list)} файлов")
         return processed
 
-    # ------------------------ SEND MEDIA ------------------------
+    # ======================== SEND MEDIA ========================
     async def send_media_group(
         self,
         chat_id: int,
@@ -260,9 +292,10 @@ class MediaProcessor:
         caption: Optional[str] = None,
         thread_id: Optional[int] = None
     ) -> bool:
+        """Отправляет медиа-группу"""
         try:
             if not self.bot:
-                raise RuntimeError("MediaProcessor: bot не передан (self.bot is None)")
+                raise RuntimeError("MediaProcessor: bot не передан")
 
             media_group = []
             for i, (media_type, file_path) in enumerate(media_paths):
@@ -284,14 +317,19 @@ class MediaProcessor:
                     )
 
             if thread_id:
-                await self.bot.send_media_group(chat_id=chat_id, media=media_group, message_thread_id=thread_id)
+                await self.bot.send_media_group(
+                    chat_id=chat_id, 
+                    media=media_group, 
+                    message_thread_id=thread_id
+                )
             else:
                 await self.bot.send_media_group(chat_id=chat_id, media=media_group)
 
+            logger.info(f"✅ Отправили медиа-группу: {len(media_paths)} файлов")
             return True
 
         except Exception as e:
-            logger.exception(f"Ошибка отправки медиа-группы: {e}")
+            logger.error(f"❌ Ошибка отправки медиа-группы: {e}")
             return False
 
     async def send_single_media(
@@ -302,9 +340,10 @@ class MediaProcessor:
         caption: Optional[str] = None,
         thread_id: Optional[int] = None
     ) -> bool:
+        """Отправляет один медиафайл"""
         try:
             if not self.bot:
-                raise RuntimeError("MediaProcessor: bot не передан (self.bot is None)")
+                raise RuntimeError("MediaProcessor: bot не передан")
 
             if media_type == "photo":
                 await self.bot.send_photo(
@@ -323,22 +362,29 @@ class MediaProcessor:
                     message_thread_id=thread_id
                 )
 
+            logger.info(f"✅ Отправили {media_type}")
             return True
 
         except Exception as e:
-            logger.exception(f"Ошибка отправки одиночного медиа: {e}")
+            logger.error(f"❌ Ошибка отправки медиа: {e}")
             return False
 
-    # ------------------------ CLEANUP ------------------------
+    # ======================== CLEANUP ========================
     def cleanup(self):
+        """Очищает все временные файлы"""
         try:
+            count = 0
             for file in self.temp_dir.glob("*"):
                 if file.is_file():
                     file.unlink()
+                    count += 1
+            if count > 0:
+                logger.info(f"🧹 Очищено файлов: {count}")
         except Exception as e:
-            logger.exception(f"Ошибка очистки временных файлов: {e}")
+            logger.error(f"❌ Ошибка очистки: {e}")
 
     def cleanup_specific(self, paths: List[Path]):
+        """Очищает конкретные файлы"""
         for path in paths:
             try:
                 if path.exists():

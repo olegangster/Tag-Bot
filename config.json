@@ -870,10 +870,11 @@
     "enabled": true,
     "image_path": "watermark.png",
     "position": "bottom_right",
-    "opacity": 0.7,
-    "scale": 0.3,
-    "scale_photo": 0.18,
-    "scale_video": 0.2
+    "opacity": 0.8,
+    "scale": 0.25,
+    "scale_photo": 0.2,
+    "scale_video": 0.25,
+    "padding": 20
   },
   "batch_mode": {
     "enabled": true,
@@ -933,5 +934,4 @@
       }
     }
   }
-
 }
