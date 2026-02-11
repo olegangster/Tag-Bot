@@ -872,9 +872,9 @@
     "position": "bottom_right",
     "opacity": 0.8,
     "scale": 0.25,
-    "scale_photo": 0.2,
+    "scale_photo": 0.15,
     "scale_video": 0.15,
-    "padding": 20
+    "padding": 15
   },
   "batch_mode": {
     "enabled": true,
