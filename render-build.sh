@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -e
 
-FFDIR=/opt/render/project/.render/ffmpeg
+PROJECT_DIR="/opt/render/project/src"
+FFDIR="/opt/render/project/.render/ffmpeg"
+
 mkdir -p "$FFDIR"
 
 if [ ! -f "$FFDIR/ffmpeg" ]; then
@@ -19,4 +21,15 @@ else
   echo "Using cached ffmpeg..."
 fi
 
-pip install -r requirements.txt
+# ВАЖНО: ставим зависимости из папки проекта (/src)
+cd "$PROJECT_DIR"
+
+if [ -f "requirements.txt" ]; then
+  pip install -r requirements.txt
+elif [ -f "pyproject.toml" ]; then
+  pip install poetry
+  poetry install --no-interaction --no-ansi
+else
+  echo "No requirements.txt or pyproject.toml found in $PROJECT_DIR"
+  exit 1
+fi
