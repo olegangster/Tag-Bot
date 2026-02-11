@@ -1012,7 +1012,8 @@ async def publish_post(message: Message, state: FSMContext, user_id: int):
         return
     
     # Обрабатываем медиа
-    processor = MediaProcessor(message.bot)
+    processor = MediaProcessor(bot=message.bot)
+
     
     await message.edit_text("⏳ Обработка файлов...")
     
