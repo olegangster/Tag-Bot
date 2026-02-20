@@ -4,18 +4,18 @@
       "name": "Основная группа",
       "chat_id": -1003827311251,
       "type": "group",
-      "invite_link": "https://t.me/+ваша_ссылка_группы",
+      "invite_link": "https://t.me/+GqZPjm0RLR9iOTQy",
       "topics": {
         "test": {
-          "name": "Тестовая тема",
+          "name": "Главная",
           "thread_id": 1
         },
         "altgirls": {
-          "name": "Альтушки",
+          "name": "🖤 Альтушки",
           "thread_id": 10
         },
         "3d": {
-          "name": "3D контент",
+          "name": "3D",
           "thread_id": 8
         },
         "games": {
@@ -40,7 +40,7 @@
       "name": "Основной канал",
       "chat_id": -1003829715647,
       "type": "channel",
-      "invite_link": "https://t.me/+ваша_ссылка_канала"
+      "invite_link": "https://t.me/+GqZPjm0RLR9iOTQy"
     }
   },
   "participants": {
