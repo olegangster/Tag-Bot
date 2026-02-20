@@ -2,7 +2,7 @@
   "platforms": {
     "main_group": {
       "name": "Основная группа",
-      "chat_id": -1003830071333,
+      "chat_id": -1003827311251,
       "type": "group",
       "invite_link": "https://t.me/+ваша_ссылка_группы",
       "topics": {
@@ -12,33 +12,33 @@
         },
         "altgirls": {
           "name": "Альтушки",
-          "thread_id": null
+          "thread_id": 10
         },
         "3d": {
           "name": "3D контент",
-          "thread_id": null
+          "thread_id": 8
         },
         "games": {
           "name": "Игры",
-          "thread_id": null
+          "thread_id": 6
         },
         "anime": {
           "name": "Аниме",
-          "thread_id": null
+          "thread_id": 12
         },
         "comics": {
           "name": "Комиксы",
-          "thread_id": null
+          "thread_id": 14
         },
         "adult": {
-          "name": "Взрослый контент",
-          "thread_id": null
+          "name": "Порно",
+          "thread_id": 14
         }
       }
     },
     "main_channel": {
       "name": "Основной канал",
-      "chat_id": -1003760057274,
+      "chat_id": -1003829715647,
       "type": "channel",
       "invite_link": "https://t.me/+ваша_ссылка_канала"
     }
