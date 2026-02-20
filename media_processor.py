@@ -333,7 +333,6 @@ class MediaProcessor:
         except Exception as e:
             logger.error(f"❌ Ошибка отправки медиа-группы: {e}")
             return False
-
     async def send_single_media(
         self,
         chat_id: int,
@@ -348,25 +347,25 @@ class MediaProcessor:
                 raise RuntimeError("MediaProcessor: bot не передан")
 
             if media_type == "photo":
-                kwargs = dict(
-                chat_id=chat_id,
-                photo=FSInputFile(file_path),
-                caption=caption,
-                parse_mode="HTML" if caption else None,
-            )
-            if thread_id is not None:
-                kwargs["message_thread_id"] = thread_id
-            await self.bot.send_photo(**kwargs)
+                kwargs = {
+                    "chat_id": chat_id,
+                    "photo": FSInputFile(file_path),
+                    "caption": caption,
+                    "parse_mode": "HTML" if caption else None,
+                }
+                if thread_id is not None:
+                    kwargs["message_thread_id"] = thread_id
+                await self.bot.send_photo(**kwargs)
             else:
-                kwargs = dict(
-                chat_id=chat_id,
-                video=FSInputFile(file_path),
-                caption=caption,
-                parse_mode="HTML" if caption else None,
-            )
-            if thread_id is not None:
-                kwargs["message_thread_id"] = thread_id
-            await self.bot.send_video(**kwargs)
+                kwargs = {
+                    "chat_id": chat_id,
+                    "video": FSInputFile(file_path),
+                    "caption": caption,
+                    "parse_mode": "HTML" if caption else None,
+                }
+                if thread_id is not None:
+                    kwargs["message_thread_id"] = thread_id
+                await self.bot.send_video(**kwargs)
 
             logger.info(f"✅ Отправили {media_type}")
             return True
@@ -376,6 +375,7 @@ class MediaProcessor:
             return False
 
     # ======================== CLEANUP ========================
+
     def cleanup(self):
         """Очищает все временные файлы"""
         try:
