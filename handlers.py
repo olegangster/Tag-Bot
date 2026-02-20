@@ -5,7 +5,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery
 from datetime import datetime
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 import json
 from pathlib import Path
 
@@ -34,6 +34,41 @@ def save_config(config):
     """Сохраняет конфигурацию в файл"""
     with open('config.json', 'w', encoding='utf-8') as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+
+def resolve_chat_and_thread(platform_id: str, topic_key: Optional[str]) -> Tuple[int, Optional[int]]:
+    """
+    Возвращает (chat_id:int, thread_id:int|None).
+
+    Если topic_key задан, но:
+      - нет topics[topic_key]
+      - или нет thread_id
+    => кидаем ValueError, чтобы НЕ отправлять в Главную молча.
+    """
+    config = load_config()
+    platform_cfg = config.get("platforms", {}).get(platform_id)
+    if not platform_cfg:
+        raise ValueError(f"platform_id '{platform_id}' не найден в config.json")
+
+    chat_id = int(platform_cfg["chat_id"])
+
+    # topic_key не задан => сознательно отправляем в Главную
+    if not topic_key:
+        return chat_id, None
+
+    topics = platform_cfg.get("topics", {})
+    topic_cfg = topics.get(topic_key)
+    if not topic_cfg:
+        raise ValueError(
+            f"topic '{topic_key}' не найден в config.json для платформы '{platform_id}'. "
+            f"Проверь category.topic и platforms.{platform_id}.topics.*"
+        )
+
+    thread_id = topic_cfg.get("thread_id")
+    if thread_id is None:
+        raise ValueError(f"У темы '{topic_key}' нет thread_id в config.json")
+
+    return chat_id, int(thread_id)
+
 
 def get_participant_data(user_id: int):
     """Находит данные участника"""
@@ -329,31 +364,26 @@ async def comic_actions(callback: CallbackQuery, state: FSMContext):
             platform_id=platform_id
         )
         
-        # Получаем chat_id
-        config = load_config()
-        chat_id = config['platforms'][platform_id]['chat_id']
-        thread_id = None
-        if topic:
-            thread_id = config['platforms'][platform_id]['topics'][topic].get('thread_id')
-        
+        # Получаем chat_id и thread_id (тема)
+        try:
+            chat_id, thread_id = resolve_chat_and_thread(platform_id, topic)
+        except Exception as e:
+            logger.error(f"❌ Неверная тема для публикации: platform={platform_id}, topic={topic} -> {e}")
+            await callback.message.edit_text(f"❌ Ошибка: не найдена тема для категории.\n\n{e}")
+            return
+
         try:
             # Отправляем как текстовое сообщение
-            if thread_id:
-                await callback.bot.send_message(
-                    chat_id=chat_id,
-                    text=caption,
-                    parse_mode='HTML',
-                    disable_web_page_preview=False,
-                    message_thread_id=thread_id
-                )
-            else:
-                await callback.bot.send_message(
-                    chat_id=chat_id,
-                    text=caption,
-                    parse_mode='HTML',
-                    disable_web_page_preview=False
-                )
-            
+            kwargs = dict(
+                chat_id=chat_id,
+                text=caption,
+                parse_mode='HTML',
+                disable_web_page_preview=False
+            )
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
+
+            await callback.bot.send_message(**kwargs)
             await callback.message.edit_text("✅ Комикс опубликован!")
             await callback.message.answer(
                 "Что дальше?",
@@ -1028,13 +1058,13 @@ async def publish_post(message: Message, state: FSMContext, user_id: int):
     # Формируем caption
     caption = format_post_caption(category_data, selected_hashtags, platform_id, description)
     
-    # Получаем chat_id
-    config = load_config()
-    chat_id = config['platforms'][platform_id]['chat_id']
-    thread_id = None
-    if topic:
-        thread_id = config['platforms'][platform_id]['topics'][topic].get('thread_id')
-    
+    # Получаем chat_id и thread_id (тема). Важно: если topic указан, но thread_id битый/пустой — НЕ публикуем в Главную молча.
+    try:
+        chat_id, thread_id = resolve_chat_and_thread(platform_id, topic)
+    except Exception as e:
+        logger.error(f"❌ Неверная тема для публикации: platform={platform_id}, topic={topic} -> {e}")
+        await message.edit_text(f"❌ Ошибка: не найдена тема для категории.\n\n{e}")
+        return
     # Публикуем
     await message.edit_text("📤 Публикация...")
     
@@ -1510,29 +1540,25 @@ async def draft_actions(callback: CallbackQuery, state: FSMContext):
                 draft['platform_id']
             )
             
-            config = load_config()
-            chat_id = config['platforms'][draft['platform_id']]['chat_id']
-            thread_id = None
-            if draft.get('topic'):
-                thread_id = config['platforms'][draft['platform_id']]['topics'][draft['topic']].get('thread_id')
-            
+            # Получаем chat_id и thread_id (тема)
             try:
-                if thread_id:
-                    await callback.bot.send_message(
-                        chat_id=chat_id,
-                        text=caption,
-                        parse_mode='HTML',
-                        disable_web_page_preview=False,
-                        message_thread_id=thread_id
-                    )
-                else:
-                    await callback.bot.send_message(
-                        chat_id=chat_id,
-                        text=caption,
-                        parse_mode='HTML',
-                        disable_web_page_preview=False
-                    )
-                
+                chat_id, thread_id = resolve_chat_and_thread(draft['platform_id'], draft.get('topic'))
+            except Exception as e:
+                logger.error(f"❌ Неверная тема для публикации черновика: platform={draft.get('platform_id')}, topic={draft.get('topic')} -> {e}")
+                await callback.message.edit_text(f"❌ Ошибка: не найдена тема для черновика.\n\n{e}")
+                return
+
+            try:
+                kwargs = dict(
+                    chat_id=chat_id,
+                    text=caption,
+                    parse_mode='HTML',
+                    disable_web_page_preview=False
+                )
+                if thread_id is not None:
+                    kwargs["message_thread_id"] = thread_id
+
+                await callback.bot.send_message(**kwargs)
                 draft_mgr.delete_draft(draft_id)
                 await callback.message.edit_text("✅ Комикс опубликован и удален из черновиков!")
                 await callback.message.answer("Что дальше?", reply_markup=main_menu())
@@ -1551,12 +1577,13 @@ async def draft_actions(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text("❌ Ошибка обработки файлов")
             return
         
-        config = load_config()
-        chat_id = config['platforms'][draft['platform_id']]['chat_id']
-        thread_id = None
-        if draft.get('topic'):
-            thread_id = config['platforms'][draft['platform_id']]['topics'][draft['topic']].get('thread_id')
-        
+        # Получаем chat_id и thread_id (тема)
+        try:
+            chat_id, thread_id = resolve_chat_and_thread(draft['platform_id'], draft.get('topic'))
+        except Exception as e:
+            logger.error(f"❌ Неверная тема для публикации черновика: platform={draft.get('platform_id')}, topic={draft.get('topic')} -> {e}")
+            await callback.message.edit_text(f"❌ Ошибка: не найдена тема для черновика.\n\n{e}")
+            return
         caption = format_post_caption(
             draft['category_data'],
             draft['selected_hashtags'],
