@@ -4,33 +4,28 @@ import json
 import uuid
 from pathlib import Path
 from typing import List, Tuple, Optional, Union
-
 from PIL import Image
 from aiogram import Bot as AiogramBot
 from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo
-from aiogram.exceptions import TelegramBadRequest
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
-
 
 def load_config() -> dict:
     cfg_path = BASE_DIR / "config.json"
     with open(cfg_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 class MediaProcessor:
     """
     ✅ ULTRA FIXED VERSION
-
+    
     Исправления:
     1. ✅ Таймаут 60 секунд для ffmpeg
     2. ✅ Простая команда overlay (без scale2ref)
     3. ✅ Увеличенный watermark (0.25 вместо 0.10)
     4. ✅ Fallback на оригинал при любых ошибках
     5. ✅ Подробное логирование
-    6. ✅ FIX: message thread not found для send_media_group (прогрев темы + retry)
     """
 
     def __init__(
@@ -38,7 +33,6 @@ class MediaProcessor:
         bot: Optional[AiogramBot] = None,
         temp_dir: Union[str, Path] = "temp_media",
     ):
-        # Совместимость: если первым аргументом передали temp_dir, а не bot
         if bot is not None and not isinstance(bot, AiogramBot) and isinstance(bot, (str, Path)):
             temp_dir = bot
             bot = None
@@ -122,7 +116,7 @@ class MediaProcessor:
             # Сохраняем
             output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}.jpg"
             out.convert("RGB").save(output_path, "JPEG", quality=95, optimize=True)
-
+            
             logger.info(f"✅ Фото watermark: scale={scale:.2f}, opacity={opacity:.2f}")
             return output_path
 
@@ -134,7 +128,7 @@ class MediaProcessor:
     async def add_video_watermark(self, file_path: Path) -> Path:
         """
         ✅ ИСПРАВЛЕННАЯ версия для видео
-
+        
         Изменения:
         1. Простая команда overlay (без scale2ref)
         2. Таймаут 60 секунд
@@ -159,10 +153,10 @@ class MediaProcessor:
             # Параметры - УВЕЛИЧЕНЫ!
             scale = wm_cfg.get("scale_video", wm_cfg.get("scale", 0.25))  # 25% вместо 10%
             scale = max(0.05, min(float(scale), 0.9))
-
+            
             opacity = float(wm_cfg.get("opacity", 0.8))  # 0.8 вместо 0.7
             opacity = max(0.0, min(opacity, 1.0))
-
+            
             padding = int(wm_cfg.get("padding", 20))
             pos = wm_cfg.get("position", "bottom_right")
 
@@ -177,6 +171,8 @@ class MediaProcessor:
                 overlay_pos = f"{padding}:{padding}"
 
             # ✅ RENDER-ОПТИМИЗИРОВАННАЯ команда ffmpeg
+            # Сначала уменьшаем видео до max 720px ширины (в 4x меньше пикселей → в 4x быстрее)
+            # -2 вместо -1 чтобы размеры были чётными (требование libx264)
             filter_complex = (
                 f"[0:v]scale='min(720,iw)':-2[scaled];"
                 f"[1:v]scale=iw*{scale}:-2,format=rgba,"
@@ -200,34 +196,35 @@ class MediaProcessor:
                 str(output_path),
             ]
 
-            logger.info(
-                f"🎬 FFmpeg (Render): scale={scale:.2f}, opacity={opacity:.2f}, preset=ultrafast, max_w=720px"
-            )
+            logger.info(f"🎬 FFmpeg (Render): scale={scale:.2f}, opacity={opacity:.2f}, preset=ultrafast, max_w=720px")
 
+            # ✅ ТАЙМАУТ 5 МИНУТ (Render.com медленный, нужно больше времени)
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-
+            
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=300.0  # ← 5 минут
+                    timeout=300.0  # ← 5 минут вместо 60 секунд
                 )
             except asyncio.TimeoutError:
                 process.kill()
                 logger.error("❌ FFmpeg таймаут (>5 мин) - используем оригинал")
                 return file_path
 
+            # Проверяем результат
             if process.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
-                logger.info("✅ Видео watermark применен успешно")
+                logger.info(f"✅ Видео watermark применен успешно")
                 return output_path
 
+            # Логируем ошибку
             err = stderr.decode(errors="ignore").strip()
             if err:
                 logger.error(f"❌ FFmpeg error (код {process.returncode}):\n{err[:500]}")
-
+            
             return file_path
 
         except FileNotFoundError:
@@ -244,6 +241,7 @@ class MediaProcessor:
             if not self.bot:
                 raise RuntimeError("MediaProcessor: bot не передан")
 
+            # Скачиваем
             file = await self.bot.get_file(file_id)
             file_bytes = await self.bot.download_file(file.file_path)
 
@@ -255,6 +253,7 @@ class MediaProcessor:
 
             logger.info(f"📥 Скачали {media_type}: {temp_path.name}")
 
+            # Обрабатываем
             if media_type == "photo":
                 processed = await self.add_photo_watermark(temp_path)
             else:
@@ -269,7 +268,7 @@ class MediaProcessor:
     async def process_batch(self, media_list: List[Tuple[str, str]]) -> List[Tuple[str, Path]]:
         """Параллельная обработка пакета медиа"""
         logger.info(f"📦 Обрабатываем {len(media_list)} файлов...")
-
+        
         tasks = [self.download_and_process(mtype, fid) for mtype, fid in media_list]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -288,30 +287,6 @@ class MediaProcessor:
         return processed
 
     # ======================== SEND MEDIA ========================
-    async def _warmup_topic(self, chat_id: int, thread_id: int) -> None:
-        """
-        Прогрев темы: отправляет невидимый символ в topic (чтобы Telegram начал
-        принимать sendMediaGroup с message_thread_id), затем пытается удалить.
-        """
-        if not self.bot:
-            return
-
-        warm_text = "\u200b"  # zero-width space (невидимый символ)
-
-        try:
-            msg = await self.bot.send_message(
-                chat_id=chat_id,
-                text=warm_text,
-                message_thread_id=thread_id
-            )
-            # Удаление не критично (может не быть прав)
-            try:
-                await self.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
     async def send_media_group(
         self,
         chat_id: int,
@@ -319,7 +294,7 @@ class MediaProcessor:
         caption: Optional[str] = None,
         thread_id: Optional[int] = None
     ) -> bool:
-        """Отправляет медиа-группу (с авто-фиксом message thread not found)"""
+        """Отправляет медиа-группу"""
         try:
             if not self.bot:
                 raise RuntimeError("MediaProcessor: bot не передан")
@@ -343,57 +318,17 @@ class MediaProcessor:
                         )
                     )
 
-            async def _send(with_thread: bool) -> None:
-                if with_thread:
-                    await self.bot.send_media_group(
-                        chat_id=chat_id,
-                        media=media_group,
-                        message_thread_id=thread_id
-                    )
-                else:
-                    await self.bot.send_media_group(chat_id=chat_id, media=media_group)
-
-            # ✅ ВАЖНО: проверка is not None (а не if thread_id)
             if thread_id is not None:
-                await _send(with_thread=True)
+                await self.bot.send_media_group(
+                    chat_id=chat_id, 
+                    media=media_group, 
+                    message_thread_id=thread_id
+                )
             else:
-                await _send(with_thread=False)
+                await self.bot.send_media_group(chat_id=chat_id, media=media_group)
 
             logger.info(f"✅ Отправили медиа-группу: {len(media_paths)} файлов")
             return True
-
-        except TelegramBadRequest as e:
-            err = str(e).lower()
-
-            # 🔥 Главный фикс
-            if thread_id is not None and "message thread not found" in err:
-                logger.warning("⚠️ message thread not found → прогреваю тему и повторяю отправку...")
-
-                await self._warmup_topic(chat_id=chat_id, thread_id=thread_id)
-
-                # Повторная попытка
-                try:
-                    await self.bot.send_media_group(
-                        chat_id=chat_id,
-                        media=media_group,
-                        message_thread_id=thread_id
-                    )
-                    logger.info(f"✅ Отправили медиа-группу после прогрева: {len(media_paths)} файлов")
-                    return True
-                except Exception as e2:
-                    logger.error(f"❌ Повтор после прогрева не помог: {e2}")
-
-                # Fallback: без темы (в общий чат)
-                try:
-                    logger.warning("↩️ Фолбэк: отправляю медиа-группу без thread_id (в общий чат).")
-                    await self.bot.send_media_group(chat_id=chat_id, media=media_group)
-                    return True
-                except Exception as e3:
-                    logger.error(f"❌ Фолбэк тоже не удался: {e3}")
-                    return False
-
-            logger.error(f"❌ Ошибка отправки медиа-группы: {e}")
-            return False
 
         except Exception as e:
             logger.error(f"❌ Ошибка отправки медиа-группы: {e}")
@@ -413,21 +348,25 @@ class MediaProcessor:
                 raise RuntimeError("MediaProcessor: bot не передан")
 
             if media_type == "photo":
-                await self.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=FSInputFile(file_path),
-                    caption=caption,
-                    parse_mode="HTML" if caption else None,
-                    message_thread_id=thread_id
-                )
+                kwargs = dict(
+                chat_id=chat_id,
+                photo=FSInputFile(file_path),
+                caption=caption,
+                parse_mode="HTML" if caption else None,
+            )
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
+            await self.bot.send_photo(**kwargs)
             else:
-                await self.bot.send_video(
-                    chat_id=chat_id,
-                    video=FSInputFile(file_path),
-                    caption=caption,
-                    parse_mode="HTML" if caption else None,
-                    message_thread_id=thread_id
-                )
+                kwargs = dict(
+                chat_id=chat_id,
+                video=FSInputFile(file_path),
+                caption=caption,
+                parse_mode="HTML" if caption else None,
+            )
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
+            await self.bot.send_video(**kwargs)
 
             logger.info(f"✅ Отправили {media_type}")
             return True
