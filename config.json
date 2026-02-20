@@ -8,7 +8,7 @@
       "topics": {
         "test": {
           "name": "Тестовая тема",
-          "thread_id": 5
+          "thread_id": 1
         },
         "altgirls": {
           "name": "Альтушки",
@@ -32,7 +32,7 @@
         },
         "adult": {
           "name": "Порно",
-          "thread_id": 14
+          "thread_id": 16
         }
       }
     },
