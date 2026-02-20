@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional, Union
 from PIL import Image
 from aiogram import Bot as AiogramBot
 from aiogram.types import FSInputFile, InputMediaPhoto, InputMediaVideo
+from aiogram.exceptions import TelegramBadRequest
 
 logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
@@ -287,6 +288,24 @@ class MediaProcessor:
         return processed
 
     # ======================== SEND MEDIA ========================
+
+    async def _warmup_topic(self, chat_id: int, thread_id: int) -> None:
+        """Прогрев темы: отправляет невидимый символ в topic и пытается удалить сообщение."""
+        if not self.bot:
+            return
+        try:
+            msg = await self.bot.send_message(
+                chat_id=chat_id,
+                text="\u200b",  # zero-width space
+                message_thread_id=thread_id
+            )
+            # Удаление не критично (может не быть прав)
+            try:
+                await self.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"⚠️ Прогрев темы не удался: {e}")
     async def send_media_group(
         self,
         chat_id: int,
@@ -294,45 +313,65 @@ class MediaProcessor:
         caption: Optional[str] = None,
         thread_id: Optional[int] = None
     ) -> bool:
-        """Отправляет медиа-группу"""
-        try:
-            if not self.bot:
-                raise RuntimeError("MediaProcessor: bot не передан")
+        """Отправляет медиа-группу в чат/тему. При message thread not found делает прогрев и 1 повтор."""
+        if not self.bot:
+            raise RuntimeError("MediaProcessor: bot не передан")
 
-            media_group = []
-            for i, (media_type, file_path) in enumerate(media_paths):
-                if media_type == "photo":
-                    media_group.append(
-                        InputMediaPhoto(
-                            media=FSInputFile(file_path),
-                            caption=caption if i == 0 else None,
-                            parse_mode="HTML" if i == 0 else None
-                        )
+        media_group = []
+        for i, (media_type, file_path) in enumerate(media_paths):
+            if media_type == "photo":
+                media_group.append(
+                    InputMediaPhoto(
+                        media=FSInputFile(file_path),
+                        caption=caption if i == 0 else None,
+                        parse_mode="HTML" if i == 0 else None
                     )
-                else:
-                    media_group.append(
-                        InputMediaVideo(
-                            media=FSInputFile(file_path),
-                            caption=caption if i == 0 else None,
-                            parse_mode="HTML" if i == 0 else None
-                        )
+                )
+            else:
+                media_group.append(
+                    InputMediaVideo(
+                        media=FSInputFile(file_path),
+                        caption=caption if i == 0 else None,
+                        parse_mode="HTML" if i == 0 else None
                     )
+                )
 
+        async def _send() -> None:
             if thread_id is not None:
                 await self.bot.send_media_group(
-                    chat_id=chat_id, 
-                    media=media_group, 
+                    chat_id=chat_id,
+                    media=media_group,
                     message_thread_id=thread_id
                 )
             else:
                 await self.bot.send_media_group(chat_id=chat_id, media=media_group)
 
+        try:
+            await _send()
             logger.info(f"✅ Отправили медиа-группу: {len(media_paths)} файлов")
             return True
+
+        except TelegramBadRequest as e:
+            # Если thread_id задан, но Telegram говорит что темы нет — пробуем прогреть и повторить 1 раз
+            msg = str(e).lower()
+            if thread_id is not None and "message thread not found" in msg:
+                logger.warning("⚠️ message thread not found → прогрев темы и повтор отправки медиа-группы...")
+                await self._warmup_topic(chat_id, thread_id)
+                try:
+                    await _send()
+                    logger.info(f"✅ Отправили медиа-группу после прогрева: {len(media_paths)} файлов")
+                    return True
+                except Exception as e2:
+                    logger.error(f"❌ Повтор после прогрева не помог: {e2}")
+                    return False
+
+            logger.error(f"❌ Ошибка отправки медиа-группы: {e}")
+            return False
 
         except Exception as e:
             logger.error(f"❌ Ошибка отправки медиа-группы: {e}")
             return False
+
     async def send_single_media(
         self,
         chat_id: int,
@@ -341,34 +380,44 @@ class MediaProcessor:
         caption: Optional[str] = None,
         thread_id: Optional[int] = None
     ) -> bool:
-        """Отправляет один медиафайл"""
-        try:
-            if not self.bot:
-                raise RuntimeError("MediaProcessor: bot не передан")
+        """Отправляет один медиафайл в чат/тему. При message thread not found делает прогрев и 1 повтор."""
+        if not self.bot:
+            raise RuntimeError("MediaProcessor: bot не передан")
+
+        async def _send() -> None:
+            kwargs = {
+                "chat_id": chat_id,
+                "caption": caption,
+                "parse_mode": "HTML" if caption else None,
+            }
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
 
             if media_type == "photo":
-                kwargs = {
-                    "chat_id": chat_id,
-                    "photo": FSInputFile(file_path),
-                    "caption": caption,
-                    "parse_mode": "HTML" if caption else None,
-                }
-                if thread_id is not None:
-                    kwargs["message_thread_id"] = thread_id
-                await self.bot.send_photo(**kwargs)
+                await self.bot.send_photo(photo=FSInputFile(file_path), **kwargs)
             else:
-                kwargs = {
-                    "chat_id": chat_id,
-                    "video": FSInputFile(file_path),
-                    "caption": caption,
-                    "parse_mode": "HTML" if caption else None,
-                }
-                if thread_id is not None:
-                    kwargs["message_thread_id"] = thread_id
-                await self.bot.send_video(**kwargs)
+                await self.bot.send_video(video=FSInputFile(file_path), **kwargs)
 
+        try:
+            await _send()
             logger.info(f"✅ Отправили {media_type}")
             return True
+
+        except TelegramBadRequest as e:
+            msg = str(e).lower()
+            if thread_id is not None and "message thread not found" in msg:
+                logger.warning("⚠️ message thread not found → прогрев темы и повтор отправки single media...")
+                await self._warmup_topic(chat_id, thread_id)
+                try:
+                    await _send()
+                    logger.info(f"✅ Отправили {media_type} после прогрева темы")
+                    return True
+                except Exception as e2:
+                    logger.error(f"❌ Повтор после прогрева не помог: {e2}")
+                    return False
+
+            logger.error(f"❌ Ошибка отправки медиа: {e}")
+            return False
 
         except Exception as e:
             logger.error(f"❌ Ошибка отправки медиа: {e}")
