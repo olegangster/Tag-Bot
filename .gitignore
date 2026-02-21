@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+temp_media/
+drafts.json
+queue.json
+*.log
+.DS_Store
