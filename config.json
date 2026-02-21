@@ -55,7 +55,7 @@
           "platform": "main_group",
           "topic": "games",
           "emoji_row": "🎮🎯🕹️👾🎲🏆🔥🌟",
-          "hashtags": ["#Overwatch", "#Genshin_Impact", "#gaming"]
+          "hashtags": ["#Overwatch", "#Genshin_Impact", "#Valorant", "#gaming"]
         },
         "naruto": {
           "name": "Naruto",
@@ -120,53 +120,6 @@
           "topic": "adult",
           "emoji_row": "🔥💋💦❤️‍🔥🍑🔞💕🌹",
           "hashtags": ["#ass", "#pussy", "#nsfw", "#porn"]
-        }
-      }
-    },
-    "adrian": {
-      "name": "Адриан",
-      "user_id": 5431193669,
-      "categories": {
-        "comics_channel": {
-          "name": "Комиксы",
-          "emoji": "💫",
-          "platform": "main_channel",
-          "emoji_row": "💫💥🦸‍♀️🦹‍♀️⚡🌟🔥🎭",
-          "hashtags": ["#DC_Comics", "#Marvel"]
-        }
-      }
-    },
-    "kirill": {
-      "name": "Кирилл",
-      "user_id": 1640449869,
-      "categories": {
-        "games_channel": {
-          "name": "Игры",
-          "emoji": "🎮",
-          "platform": "main_channel",
-          "emoji_row": "🎮🎯🕹️👾🎲🏆🔥🌟",
-          "hashtags": ["#Overwatch", "#gaming"]
-        }
-      }
-    },
-    "yulik": {
-      "name": "Юлик",
-      "user_id": 937718076,
-      "categories": {
-        "porno_channel": {
-          "name": "Порно",
-          "emoji": "🔥",
-          "platform": "main_channel",
-          "emoji_row": "🔥💋💦❤️‍🔥🍑🔞💕🌹",
-          "hashtags": ["#ass", "#porn"]
-        },
-        "naruto_channel": {
-          "name": "Naruto",
-          "emoji": "🍥",
-          "platform": "main_channel",
-          "topic": "anime",
-          "emoji_row": "🍥🔥🍜⚡🌀🦊🥷🏯",
-          "hashtags": ["#Naruto", "#anime"]
         }
       }
     }
