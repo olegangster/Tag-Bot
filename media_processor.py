@@ -127,15 +127,7 @@ class MediaProcessor:
 
     # ======================== WATERMARK VIDEO ========================
     async def add_video_watermark(self, file_path: Path) -> Path:
-        """
-        ✅ ИСПРАВЛЕННАЯ версия для видео
-        
-        Изменения:
-        1. Простая команда overlay (без scale2ref)
-        2. Таймаут 60 секунд
-        3. Увеличенный watermark (25% вместо 10%)
-        4. Fallback на оригинал
-        """
+        """Watermark на видео через ffmpeg с таймаутом"""
         try:
             wm_cfg = self.config.get("watermark", {})
             if not wm_cfg.get("enabled", False):
@@ -151,161 +143,94 @@ class MediaProcessor:
 
             output_path = self.temp_dir / f"wm_{uuid.uuid4().hex}.mp4"
 
-            # Параметры - УВЕЛИЧЕНЫ!
-            scale = wm_cfg.get("scale_video", wm_cfg.get("scale", 0.25))  # 25% вместо 10%
-            scale = max(0.05, min(float(scale), 0.9))
-            
-            opacity = float(wm_cfg.get("opacity", 0.8))  # 0.8 вместо 0.7
-            opacity = max(0.0, min(opacity, 1.0))
-            
-            padding = int(wm_cfg.get("padding", 20))
+            # Размер watermark
+            scale = wm_cfg.get("scale_video", wm_cfg.get("scale", 0.20))
+            opacity = wm_cfg.get("opacity", 0.8)
+            padding = wm_cfg.get("padding", 20)
             pos = wm_cfg.get("position", "bottom_right")
 
             # Позиция overlay
-            if pos == "bottom_right":
-                overlay_pos = f"W-w-{padding}:H-h-{padding}"
-            elif pos == "bottom_left":
-                overlay_pos = f"{padding}:H-h-{padding}"
-            elif pos == "top_right":
-                overlay_pos = f"W-w-{padding}:{padding}"
-            else:
-                overlay_pos = f"{padding}:{padding}"
+            pos_expr = {
+                "bottom_right": f"(main_w-overlay_w-{padding}):(main_h-overlay_h-{padding})",
+                "bottom_left": f"{padding}:(main_h-overlay_h-{padding})",
+                "top_right": f"(main_w-overlay_w-{padding}):{padding}",
+                "top_left": f"{padding}:{padding}"
+            }.get(pos, f"(main_w-overlay_w-{padding}):(main_h-overlay_h-{padding})")
 
-            # ✅ RENDER-ОПТИМИЗИРОВАННАЯ команда ffmpeg
-            # Сначала уменьшаем видео до max 720px ширины (в 4x меньше пикселей → в 4x быстрее)
-            # -2 вместо -1 чтобы размеры были чётными (требование libx264)
-            filter_complex = (
-                f"[0:v]scale='min(720,iw)':-2[scaled];"
-                f"[1:v]scale=iw*{scale}:-2,format=rgba,"
-                f"colorchannelmixer=aa={opacity}[wm];"
-                f"[scaled][wm]overlay={overlay_pos}:format=auto"
-            )
+            # Масштаб watermark
+            scale_filter = f"scale=iw*{scale}:-1"
 
+            # Команда ffmpeg: простая, без scale2ref
             cmd = [
                 "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "warning",
-                "-y",
                 "-i", str(file_path),
                 "-i", str(watermark_path),
-                "-filter_complex", filter_complex,
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "28",
+                "-filter_complex",
+                f"[1:v]{scale_filter}[wm];"
+                f"[0:v][wm]overlay={pos_expr}:enable='gte(t,0)':alpha={opacity}",
                 "-c:a", "copy",
-                "-movflags", "+faststart",
-                str(output_path),
+                "-y", str(output_path)
             ]
 
-            logger.info(f"🎬 FFmpeg (Render): scale={scale:.2f}, opacity={opacity:.2f}, preset=ultrafast, max_w=720px")
-
-            # ✅ ТАЙМАУТ 5 МИНУТ (Render.com медленный, нужно больше времени)
-            process = await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
             )
-            
+
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=300.0  # ← 5 минут вместо 60 секунд
-                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
             except asyncio.TimeoutError:
-                process.kill()
-                logger.error("❌ FFmpeg таймаут (>5 мин) - используем оригинал")
+                proc.kill()
+                logger.error("❌ ffmpeg таймаут 60 сек")
                 return file_path
 
-            # Проверяем результат
-            if process.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
-                logger.info(f"✅ Видео watermark применен успешно")
-                return output_path
+            if proc.returncode != 0:
+                err = stderr.decode("utf-8", errors="ignore")
+                logger.error(f"❌ ffmpeg ошибка: {err}")
+                return file_path
 
-            # Логируем ошибку
-            err = stderr.decode(errors="ignore").strip()
-            if err:
-                logger.error(f"❌ FFmpeg error (код {process.returncode}):\n{err[:500]}")
-            
-            return file_path
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                logger.error("❌ Выходной файл видео пустой")
+                return file_path
 
-        except FileNotFoundError:
-            logger.error("❌ FFmpeg не установлен на сервере")
-            return file_path
+            logger.info(f"✅ Видео watermark: scale={scale:.2f}, opacity={opacity:.2f}")
+            return output_path
+
         except Exception as e:
             logger.error(f"❌ Ошибка watermark видео: {e}")
             return file_path
 
-    # ======================== DOWNLOAD + PROCESS ========================
-    async def download_and_process(self, media_type: str, file_id: str) -> Optional[Tuple[str, Path]]:
-        """Скачивает и обрабатывает один файл"""
-        try:
-            if not self.bot:
-                raise RuntimeError("MediaProcessor: bot не передан")
-
-            # Скачиваем
-            file = await self.bot.get_file(file_id)
-            file_bytes = await self.bot.download_file(file.file_path)
-
-            ext = "jpg" if media_type == "photo" else "mp4"
-            temp_path = self.temp_dir / f"{uuid.uuid4().hex}.{ext}"
-
-            with open(temp_path, "wb") as f:
-                f.write(file_bytes.read())
-
-            logger.info(f"📥 Скачали {media_type}: {temp_path.name}")
-
-            # Обрабатываем
+    # ======================== PROCESS MEDIA ========================
+    async def process_media(self, media_paths: List[Tuple[str, Path]]) -> List[Tuple[str, Path]]:
+        """Добавляет watermark ко всем медиа"""
+        processed = []
+        for media_type, file_path in media_paths:
             if media_type == "photo":
-                processed = await self.add_photo_watermark(temp_path)
-            else:
-                processed = await self.add_video_watermark(temp_path)
-
-            return media_type, processed
-
-        except Exception as e:
-            logger.error(f"❌ Ошибка обработки медиа: {e}")
-            return None
-
-    async def process_batch(self, media_list: List[Tuple[str, str]]) -> List[Tuple[str, Path]]:
-        """Параллельная обработка пакета медиа"""
-        logger.info(f"📦 Обрабатываем {len(media_list)} файлов...")
-        
-        tasks = [self.download_and_process(mtype, fid) for mtype, fid in media_list]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        processed: List[Tuple[str, Path]] = []
-        for r in results:
-            if isinstance(r, Exception):
-                logger.error(f"❌ Exception: {r}")
-                continue
-            if r is None:
-                continue
-            mtype, path = r
-            if isinstance(mtype, str) and path is not None:
-                processed.append((mtype, path))
-
-        logger.info(f"✅ Обработано {len(processed)}/{len(media_list)} файлов")
+                processed_path = await self.add_photo_watermark(file_path)
+            else:  # video
+                processed_path = await self.add_video_watermark(file_path)
+            processed.append((media_type, processed_path))
         return processed
 
-    # ======================== SEND MEDIA ========================
-
+    # ======================== WARMUP TOPIC ========================
     async def _warmup_topic(self, chat_id: int, thread_id: int) -> None:
-        """Прогрев темы: отправляет невидимый символ в topic и пытается удалить сообщение."""
-        if not self.bot:
-            return
+        """Прогревает тему отправкой и удалением тестового сообщения"""
         try:
             msg = await self.bot.send_message(
                 chat_id=chat_id,
-                text="\u200b",  # zero-width space
+                text=".",
                 message_thread_id=thread_id
             )
-            # Удаление не критично (может не быть прав)
-            try:
-                await self.bot.delete_message(chat_id=chat_id, message_id=msg.message_id)
-            except Exception:
-                pass
+            await asyncio.sleep(0.5)
+            await self.bot.delete_message(
+                chat_id=chat_id,
+                message_id=msg.message_id
+            )  # Удалён message_thread_id — он не нужен для delete_message
         except Exception as e:
-            logger.warning(f"⚠️ Прогрев темы не удался: {e}")
+            logger.error(f"❌ Ошибка прогрева темы: {e}")
+
+    # ======================== SEND MEDIA GROUP ========================
     async def send_media_group(
         self,
         chat_id: int,
@@ -313,12 +238,14 @@ class MediaProcessor:
         caption: Optional[str] = None,
         thread_id: Optional[int] = None
     ) -> bool:
-        """Отправляет медиа-группу в чат/тему. При message thread not found делает прогрев и 1 повтор."""
+        """Отправляет группу медиа в чат/тему. При message thread not found делает прогрев и 1 повтор."""
         if not self.bot:
             raise RuntimeError("MediaProcessor: bot не передан")
 
+        processed_media = await self.process_media(media_paths)
+
         media_group = []
-        for i, (media_type, file_path) in enumerate(media_paths):
+        for i, (media_type, file_path) in enumerate(processed_media):
             if media_type == "photo":
                 media_group.append(
                     InputMediaPhoto(
