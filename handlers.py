@@ -1,2038 +1,1315 @@
-import logging
-import asyncio
-from aiogram import Router, F, Bot
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, CallbackQuery
-from datetime import datetime
-from typing import List, Tuple, Dict, Optional
-import json
-from pathlib import Path
+"""
+handlers.py — все обработчики Telegram-бота (aiogram 3.x).
 
-from states import PostFlow, QueueFlow, HashtagFlow
-from keyboards import *
-from media_processor import MediaProcessor
+Архитектура:
+- Один глобальный Router
+- Синглтоны MediaProcessor, QueueManager, DraftManager, BatchPostingService
+  создаются при первом обращении через get_*() хелперы
+- FSM через PostFlow / HashtagFlow / QueueFlow из states.py
+"""
+
+import json
+import logging
+from pathlib import Path
+from typing import Optional
+
+from aiogram import Bot, F, Router
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.types import (
+    CallbackQuery,
+    Message,
+)
+
 from batch_service import BatchPostingService
 from draft_manager import DraftManager
+from keyboards import (
+    after_post_keyboard,
+    batch_schedule_keyboard,
+    categories_keyboard,
+    category_templates_keyboard,
+    comic_confirm_keyboard,
+    comic_input_keyboard,
+    confirm_batch_final_keyboard,
+    draft_action_keyboard,
+    drafts_list_keyboard,
+    files_per_post_keyboard,
+    hashtag_templates_keyboard,
+    hashtags_keyboard,
+    main_menu,
+    media_upload_keyboard,
+    my_hashtags_menu_keyboard,
+    queue_list_keyboard,
+    queue_menu_keyboard,
+    template_actions_keyboard,
+    time_options_keyboard,
+    user_templates_list_keyboard,
+)
+from media_processor import MediaProcessor
 from queue_manager import QueueManager
+from states import HashtagFlow, PostFlow, QueueFlow
 
 logger = logging.getLogger(__name__)
 router = Router()
 
-# Глобальные менеджеры
-draft_mgr = DraftManager()
-queue_mgr = QueueManager()
+# ──────────────────────────────────────────────────────────────────────────────
+#  Конфиг
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Лок для предотвращения спама при альбомах
-user_locks = {}
-
-def load_config():
-    with open('config.json', 'r', encoding='utf-8') as f:
+def load_config() -> dict:
+    with open("config.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_config(config):
-    """Сохраняет конфигурацию в файл"""
-    with open('config.json', 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
 
-def resolve_chat_and_thread(platform_id: str, topic_key: Optional[str]) -> Tuple[int, Optional[int]]:
-    """
-    Возвращает (chat_id:int, thread_id:int|None).
+# ──────────────────────────────────────────────────────────────────────────────
+#  Синглтоны (инициализируются лениво с реальным bot-объектом)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Если topic_key задан, но:
-      - нет topics[topic_key]
-      - или нет thread_id
-    => кидаем ValueError, чтобы НЕ отправлять в Главную молча.
-    """
-    config = load_config()
-    platform_cfg = config.get("platforms", {}).get(platform_id)
-    if not platform_cfg:
-        raise ValueError(f"platform_id '{platform_id}' не найден в config.json")
+_media_processor: Optional[MediaProcessor] = None
+_queue_manager: Optional[QueueManager] = None
+_draft_manager: Optional[DraftManager] = None
+_batch_service: Optional[BatchPostingService] = None
 
-    chat_id = int(platform_cfg["chat_id"])
 
-    # topic_key не задан => сознательно отправляем в Главную
-    if not topic_key:
-        return chat_id, None
+def get_media_processor(bot: Bot) -> MediaProcessor:
+    global _media_processor
+    if _media_processor is None:
+        _media_processor = MediaProcessor(bot=bot)
+    return _media_processor
 
-    topics = platform_cfg.get("topics", {})
-    topic_cfg = topics.get(topic_key)
-    if not topic_cfg:
-        raise ValueError(
-            f"topic '{topic_key}' не найден в config.json для платформы '{platform_id}'. "
-            f"Проверь category.topic и platforms.{platform_id}.topics.*"
+
+def get_queue_manager() -> QueueManager:
+    global _queue_manager
+    if _queue_manager is None:
+        _queue_manager = QueueManager()
+    return _queue_manager
+
+
+def get_draft_manager() -> DraftManager:
+    global _draft_manager
+    if _draft_manager is None:
+        _draft_manager = DraftManager()
+    return _draft_manager
+
+
+def get_batch_service(bot: Bot) -> BatchPostingService:
+    global _batch_service
+    if _batch_service is None:
+        _batch_service = BatchPostingService(
+            media_processor=get_media_processor(bot), bot=bot
         )
-
-    thread_id = topic_cfg.get("thread_id")
-    if thread_id is None:
-        raise ValueError(f"У темы '{topic_key}' нет thread_id в config.json")
-
-    return chat_id, int(thread_id)
+    return _batch_service
 
 
-def get_participant_data(user_id: int):
-    """Находит данные участника"""
+# ──────────────────────────────────────────────────────────────────────────────
+#  Вспомогательные функции
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _get_user_category_data(user_id: int, category_name_with_emoji: str) -> Optional[dict]:
+    """Ищет категорию пользователя по отображаемому имени (с эмодзи)."""
     config = load_config()
-    for participant_key, data in config['participants'].items():
-        if data.get('user_id') == user_id:
-            return participant_key, data
-    return None, None
+    for participant in config["participants"].values():
+        if participant.get("user_id") != user_id:
+            continue
+        for cat_key, cat_data in participant["categories"].items():
+            display = f"{cat_data.get('emoji', '')} {cat_data['name']}"
+            if display == category_name_with_emoji:
+                return {"key": cat_key, **cat_data}
+    return None
 
-def get_category_data(user_id: int, category_name: str):
-    """Получает данные категории"""
-    participant_key, participant_data = get_participant_data(user_id)
-    if not participant_data:
-        return None, None, None
-    
-    for cat_key, cat_data in participant_data['categories'].items():
-        if cat_data['name'] == category_name or f"{cat_data['emoji']} {cat_data['name']}" == category_name:
-            return cat_key, cat_data, participant_data['categories'][cat_key]
-    return None, None, None
 
-def format_post_caption(category_data: Dict, selected_hashtags: List[str], platform_id: str, description: str = "") -> str:
-    """Форматирует caption для обычного поста"""
+def _get_user_category_by_key(user_id: int, category_key: str) -> Optional[dict]:
     config = load_config()
-    
-    emoji = category_data['emoji']
-    name = category_data['name'].upper()
-    emoji_row = category_data.get('emoji_row', '')
-    
-    # Хештеги по 3 в ряд
-    hashtag_lines = []
-    for i in range(0, len(selected_hashtags), 3):
-        line = ' '.join(selected_hashtags[i:i+3])
-        hashtag_lines.append(line)
-    hashtags_formatted = '\n'.join(hashtag_lines)
-    
-    platform_data = config['platforms'][platform_id]
-    invite_link = platform_data.get('invite_link', 'https://t.me/your_channel')
-    
-    caption = f"{emoji} {name} {emoji}\n\n"
-    caption += f"{emoji_row}\n"
-    
-    if selected_hashtags:
-        caption += f"{hashtags_formatted}\n"
-        caption += f"{emoji_row}\n\n"
-    
-    if description:
-        caption += f"{description}\n\n"
-    
-    caption += f"↘️⬇️↙️\n"
-    caption += f'<a href="{invite_link}">Ссылка для друга</a>'
-    
-    return caption
+    for participant in config["participants"].values():
+        if participant.get("user_id") != user_id:
+            continue
+        cat_data = participant["categories"].get(category_key)
+        if cat_data:
+            return {"key": category_key, **cat_data}
+    return None
 
-def format_comic_post(category_data: Dict, comic_title: str, comic_link: str, 
-                     selected_hashtags: List[str], platform_id: str) -> str:
-    """Форматирует пост для комикса"""
+
+def _is_authorized(user_id: int) -> bool:
     config = load_config()
-    
-    emoji = category_data['emoji']
-    name = category_data['name'].upper()
-    emoji_row = category_data.get('emoji_row', '')
-    
-    platform_data = config['platforms'][platform_id]
-    invite_link = platform_data.get('invite_link', 'https://t.me/your_channel')
-    
-    # Основной контент - название комикса как гиперссылка
-    caption = f"{emoji} {name} {emoji}\n\n"
-    caption += f"{emoji_row}\n\n"
-    caption += f'📖 <b><u><a href="{comic_link}">{comic_title}</a></u></b>\n\n'
-    
-    # Хештеги (опционально для комиксов)
-    if selected_hashtags:
-        hashtag_lines = []
-        for i in range(0, len(selected_hashtags), 3):
-            line = ' '.join(selected_hashtags[i:i+3])
-            hashtag_lines.append(line)
-        hashtags_formatted = '\n'.join(hashtag_lines)
-        caption += f"{hashtags_formatted}\n\n"
-    
-    caption += f"{emoji_row}\n\n"
-    caption += f"↘️⬇️↙️\n"
-    caption += f'<a href="{invite_link}">Ссылка для друга</a>'
-    
-    return caption
+    return any(
+        p.get("user_id") == user_id for p in config["participants"].values()
+    )
 
-async def safe_edit_status(message: Message, state: FSMContext, text: str):
-    """Безопасное редактирование статусного сообщения"""
-    data = await state.get_data()
-    status_id = data.get('status_message_id')
-    
-    if status_id:
-        try:
-            await message.bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=status_id,
-                text=text,
-                parse_mode='HTML'
-            )
-            return
-        except Exception:
-            pass
-    
-    # Отправляем новое
-    sent = await message.answer(text, parse_mode='HTML')
-    await state.update_data(status_message_id=sent.message_id)
 
-# ============ ГЛАВНОЕ МЕНЮ ============
+async def _safe_delete(message: Message):
+    """Удаляет сообщение, игнорируя ошибки."""
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  /start  и главное меню
+# ──────────────────────────────────────────────────────────────────────────────
 
 @router.message(Command("start"))
-@router.message(F.text == "🏠 Главная")
 async def cmd_start(message: Message, state: FSMContext):
-    """Главное меню"""
-    await state.clear()
-    
-    participant_key, participant_data = get_participant_data(message.from_user.id)
-    
-    if not participant_data:
-        await message.answer(
-            "❌ Вы не зарегистрированы в системе.\n"
-            f"Ваш ID: <code>{message.from_user.id}</code>\n\n"
-            "Обратитесь к администратору.",
-            parse_mode='HTML'
-        )
+    if not _is_authorized(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этому боту.")
         return
-    
-    await message.answer(
-        f"👋 <b>Привет, {participant_data['name']}!</b>\n\n"
-        "Выберите действие:",
-        reply_markup=main_menu(),
-        parse_mode='HTML'
-    )
-
-# ============ СОЗДАНИЕ ПОСТА ============
-
-@router.message(F.text.in_(["➕ Создать пост", "➕ Ещё пост"]))
-async def create_post(message: Message, state: FSMContext):
-    """Начало создания поста"""
     await state.clear()
-    await state.set_state(PostFlow.selecting_category)
-    await state.update_data(is_batch_mode=False)
     await message.answer(
-        "📁 <b>Выберите категорию:</b>",
-        reply_markup=categories_keyboard(message.from_user.id),
-        parse_mode='HTML'
+        "👋 Привет! Выберите действие:",
+        reply_markup=main_menu(),
     )
+
+
+@router.message(F.text == "🏠 Главная")
+async def go_home(message: Message, state: FSMContext):
+    if not _is_authorized(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer("🏠 Главное меню", reply_markup=main_menu())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Очистка чата
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.message(F.text == "🧹 Очистить чат")
+async def clear_chat(message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+    config = load_config()
+    limit = config.get("posting", {}).get("clear_chat_limit", 100)
+    deleted = 0
+    msg_id = message.message_id
+    for i in range(msg_id, max(msg_id - limit, 0), -1):
+        try:
+            await message.bot.delete_message(message.chat.id, i)
+            deleted += 1
+        except Exception:
+            pass
+    await message.answer(f"🧹 Удалено сообщений: {deleted}", reply_markup=main_menu())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  СОЗДАНИЕ ПОСТА — выбор категории
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.message(F.text == "➕ Создать пост")
+async def create_post_start(message: Message, state: FSMContext):
+    if not _is_authorized(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer(
+        "📁 Выберите категорию:",
+        reply_markup=categories_keyboard(message.from_user.id),
+    )
+    await state.set_state(PostFlow.selecting_category)
+
+
+@router.message(F.text == "➕ Ещё пост")
+async def another_post(message: Message, state: FSMContext):
+    await create_post_start(message, state)
+
 
 @router.message(PostFlow.selecting_category)
 async def category_selected(message: Message, state: FSMContext):
-    """Категория выбрана"""
-    if message.text == "🏠 Главная":
-        await cmd_start(message, state)
+    if message.text in ("❌ Отмена", "🏠 Главная"):
+        await go_home(message, state)
         return
-    
-    category_name = message.text
-    cat_key, cat_data, _ = get_category_data(message.from_user.id, category_name)
-    
-    if not cat_data:
-        await message.answer("❌ Категория не найдена")
+
+    cat = _get_user_category_data(message.from_user.id, message.text)
+    if not cat:
+        await message.answer("❌ Категория не найдена. Попробуйте ещё раз.")
         return
-    
-    data = await state.get_data()
-    is_batch = data.get('is_batch_mode', False)
-    
-    # Проверяем, это комиксы или обычный пост
-    is_comic_mode = cat_data.get('mode') == 'link_post'
-    
-    await state.update_data(
-        category_key=cat_key,
-        category_data=cat_data,
-        platform_id=cat_data['platform'],
-        topic=cat_data.get('topic'),
-        media_files=[],
-        selected_hashtags=[],
-        description="",
-        is_comic_mode=is_comic_mode
-    )
-    
-    if is_comic_mode and not is_batch:
-        # Для комиксов - запрашиваем ссылку
-        await state.set_state(PostFlow.comic_link)
-        await message.answer(
-            f"✅ Категория: <b>{cat_data['emoji']} {cat_data['name']}</b>\n\n"
-            "🔗 <b>Отправьте ссылку на комикс:</b>\n"
-            "(Например: https://readcomiconline.li/Comic/...)",
-            reply_markup=comic_input_keyboard(),
-            parse_mode='HTML'
+
+    # Режим ссылки-поста (комикс)
+    if cat.get("mode") == "link_post":
+        await state.update_data(
+            category_key=cat["key"],
+            category_data=cat,
+            platform_id=cat.get("platform", "main_channel"),
+            topic=cat.get("topic"),
         )
-    else:
-        # Обычный режим загрузки медиа
-        next_state = PostFlow.batch_uploading if is_batch else PostFlow.uploading_media
-        await state.set_state(next_state)
-        
-        mode = "пакетной загрузки" if is_batch else "поста"
         await message.answer(
-            f"✅ Категория: <b>{cat_data['emoji']} {cat_data['name']}</b>\n\n"
-            f"📸 Отправьте фото или видео для {mode}:",
-            reply_markup=media_upload_keyboard(0),
-            parse_mode='HTML'
+            f"🔗 Режим «Комикс»\n\nВведите ссылку на комикс:",
+            reply_markup=comic_input_keyboard(),
+        )
+        await state.set_state(PostFlow.comic_link)
+        return
+
+    await state.update_data(
+        category_key=cat["key"],
+        category_data=cat,
+        platform_id=cat.get("platform", "main_channel"),
+        topic=cat.get("topic"),
+        media_files=[],
+    )
+    await message.answer(
+        f"📸 Загружайте фото/видео для категории «{cat['name']}».\n"
+        "Нажмите «Далее» когда закончите.",
+        reply_markup=media_upload_keyboard(0),
+    )
+    await state.set_state(PostFlow.uploading_media)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ЗАГРУЗКА МЕДИА
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.message(PostFlow.uploading_media, F.photo | F.video)
+async def media_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    media_files = data.get("media_files", [])
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        media_files.append(("photo", file_id))
+    elif message.video:
+        media_files.append(("video", message.video.file_id))
+
+    await state.update_data(media_files=media_files)
+    count = len(media_files)
+
+    config = load_config()
+    threshold = config.get("posting", {}).get("upload_feedback_threshold", 5)
+    if count % threshold == 0 or count == 1:
+        await message.answer(
+            f"✅ Загружено файлов: {count}",
+            reply_markup=media_upload_keyboard(count),
         )
 
-# ============ РЕЖИМ КОМИКСОВ ============
+
+@router.message(PostFlow.uploading_media, F.text.startswith("➡️ Далее"))
+async def media_next(message: Message, state: FSMContext):
+    data = await state.get_data()
+    media_files = data.get("media_files", [])
+
+    if not media_files:
+        await message.answer("⚠️ Загрузите хотя бы один файл.")
+        return
+
+    cat = data["category_data"]
+    await message.answer(
+        "🏷 Выберите хештеги:",
+        reply_markup=hashtags_keyboard(
+            hashtags=cat.get("hashtags", []),
+            selected=[],
+            user_id=message.from_user.id,
+            category_key=data["category_key"],
+        ),
+    )
+    await state.set_state(PostFlow.selecting_hashtags)
+
+
+@router.message(PostFlow.uploading_media, F.text == "💾 В черновик")
+async def save_to_draft_from_upload(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("media_files"):
+        await message.answer("⚠️ Нет файлов для сохранения.")
+        return
+
+    dm = get_draft_manager()
+    cat = data["category_data"]
+    draft_id = dm.create_draft(
+        user_id=message.from_user.id,
+        name=f"{cat['name']} — черновик",
+        category_key=data["category_key"],
+        category_data=cat,
+        platform_id=data["platform_id"],
+        media_files=data["media_files"],
+        selected_hashtags=[],
+        topic=data.get("topic"),
+    )
+    await state.clear()
+    await message.answer(
+        f"💾 Черновик сохранён (ID: {draft_id})",
+        reply_markup=main_menu(),
+    )
+
+
+@router.message(PostFlow.uploading_media, F.text == "📥 В очередь")
+async def add_to_queue_from_upload(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("media_files"):
+        await message.answer("⚠️ Нет файлов для добавления.")
+        return
+
+    qm = get_queue_manager()
+    cat = data["category_data"]
+    qm.add_to_queue(
+        user_id=message.from_user.id,
+        name=f"{cat['name']}",
+        category_key=data["category_key"],
+        category_data=cat,
+        platform_id=data["platform_id"],
+        media_files=data["media_files"],
+        selected_hashtags=[],
+        topic=data.get("topic"),
+    )
+    await state.clear()
+    await message.answer(
+        f"📥 Добавлено в очередь ({len(data['media_files'])} файлов)",
+        reply_markup=main_menu(),
+    )
+
+
+@router.message(PostFlow.uploading_media, F.text == "🗑️ Очистить всё")
+async def clear_media(message: Message, state: FSMContext):
+    await state.update_data(media_files=[])
+    await message.answer("🗑️ Все файлы удалены.", reply_markup=media_upload_keyboard(0))
+
+
+@router.message(PostFlow.uploading_media, F.text == "❌ Отмена")
+async def cancel_upload(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Отменено.", reply_markup=main_menu())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  КОМИКСЫ
+# ──────────────────────────────────────────────────────────────────────────────
 
 @router.message(PostFlow.comic_link)
 async def comic_link_received(message: Message, state: FSMContext):
-    """Получена ссылка на комикс"""
     if message.text == "❌ Отмена":
-        await cmd_start(message, state)
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=main_menu())
         return
-    
-    # Простая валидация ссылки
-    if not message.text.startswith(('http://', 'https://')):
-        await message.answer(
-            "❌ Пожалуйста, отправьте корректную ссылку, начинающуюся с http:// или https://",
-            reply_markup=comic_input_keyboard()
-        )
+
+    link = message.text.strip()
+    if not link.startswith("http"):
+        await message.answer("⚠️ Введите корректную ссылку (начинается с http).")
         return
-    
-    await state.update_data(comic_link=message.text)
-    await state.set_state(PostFlow.comic_title)
-    
+
+    await state.update_data(comic_link=link)
     await message.answer(
-        "✅ Ссылка сохранена!\n\n"
-        "📝 <b>Теперь введите название комикса:</b>\n"
-        "(Например: Spider-Man #1)",
+        "📝 Теперь введите название комикса:",
         reply_markup=comic_input_keyboard(),
-        parse_mode='HTML'
     )
+    await state.set_state(PostFlow.comic_title)
+
 
 @router.message(PostFlow.comic_title)
 async def comic_title_received(message: Message, state: FSMContext):
-    """Получено название комикса"""
     if message.text == "❌ Отмена":
-        await cmd_start(message, state)
-        return
-    
-    await state.update_data(comic_title=message.text)
-    
-    data = await state.get_data()
-    comic_link = data.get('comic_link', '')
-    comic_title = message.text
-    category_data = data['category_data']
-    platform_id = data['platform_id']
-    
-    # Показываем превью
-    preview = format_comic_post(
-        category_data=category_data,
-        comic_title=comic_title,
-        comic_link=comic_link,
-        selected_hashtags=[],
-        platform_id=platform_id
-    )
-    
-    await message.answer(
-        "📋 <b>Превью поста:</b>\n\n" + "─" * 30,
-        parse_mode='HTML'
-    )
-    
-    await message.answer(
-        preview,
-        parse_mode='HTML',
-        disable_web_page_preview=True
-    )
-    
-    await message.answer(
-        "─" * 30 + "\n\n"
-        "Что дальше?",
-        reply_markup=comic_confirm_keyboard(),
-        parse_mode='HTML'
-    )
-
-@router.callback_query(F.data.startswith("comic:"))
-async def comic_actions(callback: CallbackQuery, state: FSMContext):
-    """Действия с комиксом"""
-    action = callback.data.split(":")[1]
-    
-    if action == "publish":
-        await callback.answer("📤 Публикуем...")
-        
-        data = await state.get_data()
-        category_data = data['category_data']
-        platform_id = data['platform_id']
-        topic = data.get('topic')
-        comic_link = data.get('comic_link', '')
-        comic_title = data.get('comic_title', '')
-        selected_hashtags = data.get('selected_hashtags', [])
-        
-        # Формируем caption
-        caption = format_comic_post(
-            category_data=category_data,
-            comic_title=comic_title,
-            comic_link=comic_link,
-            selected_hashtags=selected_hashtags,
-            platform_id=platform_id
-        )
-        
-        # Получаем chat_id и thread_id (тема)
-        try:
-            chat_id, thread_id = resolve_chat_and_thread(platform_id, topic)
-        except Exception as e:
-            logger.error(f"❌ Неверная тема для публикации: platform={platform_id}, topic={topic} -> {e}")
-            await callback.message.edit_text(f"❌ Ошибка: не найдена тема для категории.\n\n{e}")
-            return
-
-        try:
-            # Отправляем как текстовое сообщение
-            kwargs = dict(
-                chat_id=chat_id,
-                text=caption,
-                parse_mode='HTML',
-                disable_web_page_preview=False
-            )
-            if thread_id is not None:
-                kwargs["message_thread_id"] = thread_id
-
-            await callback.bot.send_message(**kwargs)
-            await callback.message.edit_text("✅ Комикс опубликован!")
-            await callback.message.answer(
-                "Что дальше?",
-                reply_markup=after_post_keyboard()
-            )
-            await state.clear()
-            
-        except Exception as e:
-            logger.error(f"Ошибка публикации комикса: {e}")
-            await callback.message.edit_text(f"❌ Ошибка публикации: {str(e)}")
-        
-        return
-    
-    if action == "add_hashtags":
-        data = await state.get_data()
-        category_data = data['category_data']
-        cat_key = data['category_key']
-        all_hashtags = category_data.get('hashtags', [])
-        selected = data.get('selected_hashtags', [])
-        
-        await callback.message.edit_text(
-            "🏷 <b>Выберите хештеги для комикса:</b>\n\n"
-            "💡 Для комиксов хештеги необязательны",
-            reply_markup=hashtags_keyboard(
-                all_hashtags, selected,
-                callback.from_user.id, cat_key
-            ),
-            parse_mode='HTML'
-        )
-        await state.set_state(PostFlow.comic_hashtags)
-        return
-    
-    if action == "edit_title":
-        await callback.message.answer(
-            "📝 <b>Введите новое название комикса:</b>",
-            reply_markup=comic_input_keyboard(),
-            parse_mode='HTML'
-        )
-        await state.set_state(PostFlow.comic_title)
-        return
-    
-    if action == "edit_link":
-        await callback.message.answer(
-            "🔗 <b>Введите новую ссылку на комикс:</b>",
-            reply_markup=comic_input_keyboard(),
-            parse_mode='HTML'
-        )
-        await state.set_state(PostFlow.comic_link)
-        return
-    
-    if action == "cancel":
-        await callback.message.edit_text("❌ Отменено")
-        await callback.message.answer("Что дальше?", reply_markup=main_menu())
         await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=main_menu())
         return
 
-
-# ============ ЗАГРУЗКА МЕДИА (АНТИСПАМ!) ============
-
-async def handle_media_input(message: Message, state: FSMContext):
-    """Обработка входящих медиа с антиспамом"""
-    user_id = message.from_user.id
-    
-    if user_id not in user_locks:
-        user_locks[user_id] = asyncio.Lock()
-    
-    async with user_locks[user_id]:
-        data = await state.get_data()
-        media_files = data.get('media_files', [])
-        
-        # Добавляем медиа с message_id для сортировки по порядку
-        if message.photo:
-            file_id = message.photo[-1].file_id
-            unique_id = message.photo[-1].file_unique_id
-            media_files.append(('photo', file_id, unique_id, message.message_id))
-        elif message.video:
-            file_id = message.video.file_id
-            unique_id = message.video.file_unique_id
-            media_files.append(('video', file_id, unique_id, message.message_id))
-        
-        # Дебаунс для альбомов
-        if message.media_group_id:
-            import time
-            ts = time.time()
-            await state.update_data(media_files=media_files, last_media_ts=ts)
-            await asyncio.sleep(0.5)
-            
-            # Проверяем что мы последние
-            data2 = await state.get_data()
-            if data2.get('last_media_ts') != ts:
-                return
-        else:
-            await state.update_data(media_files=media_files)
-        
-        # Обновляем статус ОДНИМ сообщением
-        count = len(media_files)
-        await safe_edit_status(
-            message, state,
-            f"✅ Загружено: <b>{count}</b> файл(ов)\n\n"
-            "Отправьте еще или нажмите <b>➡️ Далее</b>"
-        )
-
-@router.message(PostFlow.uploading_media, F.photo | F.video)
-@router.message(PostFlow.batch_uploading, F.photo | F.video)
-async def media_received(message: Message, state: FSMContext):
-    """Получение медиа"""
-    await handle_media_input(message, state)
-
-# ============ КНОПКИ УПРАВЛЕНИЯ ЗАГРУЗКОЙ ============
-
-@router.message(PostFlow.uploading_media, F.text.startswith("➡️ Далее"))
-@router.message(PostFlow.batch_uploading, F.text.startswith("➡️ Далее"))
-async def media_done(message: Message, state: FSMContext):
-    """Завершение загрузки медиа"""
+    title = message.text.strip()
+    await state.update_data(comic_title=title)
     data = await state.get_data()
-    media_files = data.get('media_files', [])
-    
-    if not media_files:
-        await message.answer("❌ Сначала отправьте хотя бы один файл")
-        return
-    
-    # ВАЖНО: сортируем по message_id чтобы сохранить порядок загрузки
-    # Telegram может доставить фото из альбома не по порядку
-    media_files_sorted = sorted(media_files, key=lambda x: x[3] if len(x) > 3 else 0)
-    await state.update_data(media_files=media_files_sorted)
-    media_files = media_files_sorted
-    
-    is_batch = await state.get_state() == PostFlow.batch_uploading
-    
-    if is_batch:
-        # Пакетный режим - спрашиваем сколько файлов в посте
-        await state.set_state(PostFlow.batch_schedule)
-        await state.update_data(batch_step='files_per_post')
-        await message.answer(
-            f"📊 Загружено <b>{len(media_files)}</b> файлов\n\n"
-            "⚙️ Сколько файлов объединять в один пост?",
-            reply_markup=files_per_post_keyboard(),
-            parse_mode='HTML'
-        )
-    else:
-        # Обычный режим - переходим к хештегам
-        category_data = data['category_data']
-        all_hashtags = category_data.get('hashtags', [])
-        cat_key = data['category_key']
-        
-        await state.set_state(PostFlow.selecting_hashtags)
-        await message.answer(
-            "🏷 <b>Выберите хештеги:</b>",
-            reply_markup=hashtags_keyboard(
-                all_hashtags, [],
-                message.from_user.id, cat_key
-            ),
-            parse_mode='HTML'
+
+    preview = (
+        f"🔗 <b>Комикс готов к публикации</b>\n\n"
+        f"📖 Название: {title}\n"
+        f"🔗 Ссылка: {data['comic_link']}\n\n"
+        f"Выберите действие:"
+    )
+    await message.answer(preview, reply_markup=comic_confirm_keyboard(), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "comic:publish")
+async def comic_publish(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    mp = get_media_processor(callback.bot)
+    config = load_config()
+
+    cat = data["category_data"]
+    platform_id = data["platform_id"]
+    chat_id = config["platforms"][platform_id]["chat_id"]
+    thread_id = None
+    if data.get("topic"):
+        thread_id = (
+            config["platforms"][platform_id]["topics"]
+            .get(data["topic"], {})
+            .get("thread_id")
         )
 
-@router.message(PostFlow.uploading_media, F.text == "🗑️ Очистить всё")
-@router.message(PostFlow.batch_uploading, F.text == "🗑️ Очистить всё")
-async def clear_media(message: Message, state: FSMContext):
-    """Очистка загруженных файлов"""
-    await state.update_data(media_files=[])
-    await message.answer(
-        "🗑️ Файлы очищены\n\nОтправьте новые фото или видео:",
-        reply_markup=media_upload_keyboard(0)
+    invite_link = config["platforms"][platform_id].get("invite_link", "")
+    emoji_row = cat.get("emoji_row", "")
+    caption = (
+        f"{cat['emoji']} {cat['name'].upper()} {cat['emoji']}\n\n"
+        f"{emoji_row}\n\n"
+        f'📖 <b><u><a href="{data["comic_link"]}">{data["comic_title"]}</a></u></b>\n\n'
+        f"{emoji_row}\n\n"
+        f"↘️⬇️↙️\n"
+        f'<a href="{invite_link}">Ссылка для друга</a>'
     )
 
-@router.message(PostFlow.uploading_media, F.text == "❌ Отмена")
-@router.message(PostFlow.batch_uploading, F.text == "❌ Отмена")
-async def cancel_upload(message: Message, state: FSMContext):
-    """Отмена загрузки"""
-    await cmd_start(message, state)
+    kwargs = dict(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=False)
+    if thread_id:
+        kwargs["message_thread_id"] = thread_id
+    await callback.bot.send_message(**kwargs)
 
-# ============ СОХРАНЕНИЕ В ЧЕРНОВИК/ОЧЕРЕДЬ ============
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("✅ Комикс опубликован!", reply_markup=after_post_keyboard())
+    await callback.answer()
 
-@router.message(PostFlow.uploading_media, F.text == "💾 В черновик")
-@router.message(PostFlow.batch_uploading, F.text == "💾 В черновик")
-async def save_to_draft_prompt(message: Message, state: FSMContext):
-    """Запрос названия для черновика"""
+
+@router.callback_query(F.data == "comic:cancel")
+async def comic_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("❌ Отменено.", reply_markup=main_menu())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "comic:edit_title")
+async def comic_edit_title(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("📝 Введите новое название:", reply_markup=comic_input_keyboard())
+    await state.set_state(PostFlow.comic_title)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "comic:edit_link")
+async def comic_edit_link(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔗 Введите новую ссылку:", reply_markup=comic_input_keyboard())
+    await state.set_state(PostFlow.comic_link)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "comic:add_hashtags")
+async def comic_add_hashtags(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    media_files = data.get('media_files', [])
-    
-    if not media_files:
-        await message.answer("❌ Сначала загрузите файлы")
-        return
-    
-    await state.update_data(saving_to='draft')
-    await message.answer(
-        "📝 <b>Введите название черновика:</b>\n"
-        "(Например: Альтушки 10.02 15:30)",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text="❌ Отмена")]],
-            resize_keyboard=True
-        ),
-        parse_mode='HTML'
-    )
-
-@router.message(PostFlow.uploading_media, F.text == "📥 В очередь")
-@router.message(PostFlow.batch_uploading, F.text == "📥 В очередь")
-async def save_to_queue_prompt(message: Message, state: FSMContext):
-    """Запрос названия для очереди"""
-    data = await state.get_data()
-    media_files = data.get('media_files', [])
-    
-    if not media_files:
-        await message.answer("❌ Сначала загрузите файлы")
-        return
-    
-    # Сразу переходим к выбору хештегов
-    category_data = data['category_data']
-    all_hashtags = category_data.get('hashtags', [])
-    cat_key = data['category_key']
-    
-    await state.update_data(saving_to='queue')
-    await state.set_state(PostFlow.selecting_hashtags)
-    await message.answer(
-        "📥 <b>Добавление в очередь</b>\n\n"
-        "🏷 Выберите хештеги:",
+    cat = data["category_data"]
+    await callback.message.answer(
+        "🏷 Выберите хештеги для комикса:",
         reply_markup=hashtags_keyboard(
-            all_hashtags, [],
-            message.from_user.id, cat_key
+            hashtags=cat.get("hashtags", []),
+            selected=data.get("selected_hashtags", []),
+            user_id=callback.from_user.id,
+            category_key=data["category_key"],
         ),
-        parse_mode='HTML'
     )
+    await state.update_data(is_comic=True)
+    await state.set_state(PostFlow.comic_hashtags)
+    await callback.answer()
 
-@router.message(PostFlow.uploading_media)
-@router.message(PostFlow.batch_uploading)
-async def save_named_item(message: Message, state: FSMContext):
-    """Сохранение черновика/очереди с названием"""
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ХЕШТЕГИ — выбор
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _hashtag_toggle(callback: CallbackQuery, state: FSMContext):
+    """Общая логика переключения хештега."""
+    tag = callback.data.split(":", 1)[1]
     data = await state.get_data()
-    saving_to = data.get('saving_to')
-    
-    if not saving_to:
-        return
-    
-    if message.text == "❌ Отмена":
-        await cmd_start(message, state)
-        return
-    
-    name = message.text
-    
-    if saving_to == 'draft':
-        # Сохраняем в черновики
-        draft_id = draft_mgr.create_draft(
-            user_id=message.from_user.id,
-            name=name,
-            category_key=data['category_key'],
-            category_data=data['category_data'],
-            platform_id=data['platform_id'],
-            media_files=data.get('media_files', []),
-            selected_hashtags=[],
-            description="",
-            topic=data.get('topic')
-        )
-        
-        await message.answer(
-            f"💾 Сохранено в черновики!\n\n"
-            f"📄 Название: <b>{name}</b>\n"
-            f"🆔 ID: <code>{draft_id}</code>",
-            reply_markup=main_menu(),
-            parse_mode='HTML'
-        )
-        await state.clear()
+    selected = data.get("selected_hashtags", [])
 
-
-# ============ ХЕШТЕГИ - ОСНОВНОЙ ФУНКЦИОНАЛ ============
-
-@router.callback_query(F.data.startswith("tag:"))
-async def hashtag_selection(callback: CallbackQuery, state: FSMContext):
-    """Выбор хештегов"""
-    data = await state.get_data()
-    category_data = data['category_data']
-    all_hashtags = category_data.get('hashtags', [])
-    selected = data.get('selected_hashtags', [])
-    cat_key = data['category_key']
-    
-    action = callback.data[4:]  # убираем "tag:"
-    
-    if action == "select_all":
-        selected = all_hashtags.copy()
-        await state.update_data(selected_hashtags=selected)
-        await callback.answer("✅ Все выбраны")
-        
-        await callback.message.edit_reply_markup(
-            reply_markup=hashtags_keyboard(
-                all_hashtags, selected,
-                callback.from_user.id, cat_key
-            )
-        )
-        return
-    
-    if action == "clear_all":
+    if tag == "select_all":
+        cat = data["category_data"]
+        selected = list(cat.get("hashtags", []))
+    elif tag == "clear_all":
         selected = []
-        await state.update_data(selected_hashtags=selected)
-        await callback.answer("❌ Сброшено")
-        
-        await callback.message.edit_reply_markup(
-            reply_markup=hashtags_keyboard(
-                all_hashtags, selected,
-                callback.from_user.id, cat_key
-            )
+    elif tag in selected:
+        selected.remove(tag)
+    else:
+        selected.append(tag)
+
+    await state.update_data(selected_hashtags=selected)
+    cat = data["category_data"]
+    await callback.message.edit_reply_markup(
+        reply_markup=hashtags_keyboard(
+            hashtags=cat.get("hashtags", []),
+            selected=selected,
+            user_id=callback.from_user.id,
+            category_key=data["category_key"],
         )
-        return
-    
-    if action == "templates":
-        # Показываем шаблоны
-        await callback.message.edit_text(
-            "📋 <b>Мои шаблоны хештегов:</b>\n\n"
-            "Выберите шаблон для применения:",
-            reply_markup=hashtag_templates_keyboard(
-                callback.from_user.id, cat_key, selected
-            ),
-            parse_mode='HTML'
-        )
-        return
-    
-    if action == "back":
-        # Возврат к хештегам
-        await callback.message.edit_text(
-            "🏷 <b>Выберите хештеги:</b>",
-            reply_markup=hashtags_keyboard(
-                all_hashtags, selected,
-                callback.from_user.id, cat_key
-            ),
-            parse_mode='HTML'
-        )
-        return
-    
-    if action == "add_custom":
-        # Добавление пользовательского хештега
-        await callback.message.answer(
-            "➕ <b>Добавление своего хештега</b>\n\n"
-            "Введите хештег (например: #myhashtag):\n\n"
-            "💡 Хештег должен начинаться с # и не содержать пробелов",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="❌ Отмена")]],
-                resize_keyboard=True
-            ),
-            parse_mode='HTML'
-        )
-        await state.set_state(HashtagFlow.adding_custom)
-        return
-    
-    if action == "save_template":
-        # Сохранение как шаблон
-        if not selected:
-            await callback.answer("❌ Выберите хотя бы один хештег", show_alert=True)
-            return
-        
-        await callback.message.answer(
-            "💾 <b>Сохранение шаблона</b>\n\n"
-            f"Выбрано хештегов: {len(selected)}\n\n"
-            "Введите название шаблона:\n"
-            "(Например: Топ альтушки, Популярные, Минимум)",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="❌ Отмена")]],
-                resize_keyboard=True
-            ),
-            parse_mode='HTML'
-        )
-        await state.set_state(HashtagFlow.naming_template)
-        return
-    
+    )
+    await callback.answer()
+
+
+@router.callback_query(PostFlow.selecting_hashtags, F.data.startswith("tag:"))
+async def hashtag_callback_post(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+
     if action == "done":
-        # Завершение выбора хештегов
-        current_state = await state.get_state()
-        saving_to = data.get('saving_to')
-        is_comic = data.get('is_comic_mode', False)
-        
-        # Для комиксов - возвращаемся к превью
-        if current_state == PostFlow.comic_hashtags or is_comic:
-            await state.update_data(selected_hashtags=selected)
-            comic_link = data.get('comic_link', '')
-            comic_title = data.get('comic_title', '')
-            platform_id = data['platform_id']
-            
-            preview = format_comic_post(
-                category_data=category_data,
-                comic_title=comic_title,
-                comic_link=comic_link,
-                selected_hashtags=selected,
-                platform_id=platform_id
-            )
-            
-            await callback.message.edit_text("📋 <b>Обновленное превью:</b>", parse_mode='HTML')
-            await callback.message.answer(preview, parse_mode='HTML', disable_web_page_preview=True)
-            await callback.message.answer(
-                "Что дальше?",
-                reply_markup=comic_confirm_keyboard()
-            )
-            return
-        
-        # Для очереди - запрашиваем название
-        if saving_to == 'queue':
-            await state.update_data(selected_hashtags=selected)
-            await callback.message.edit_text(
-                f"✅ Выбрано хештегов: {len(selected)}\n\n"
-                "📝 Введите название для очереди:"
-            )
-            await callback.message.answer(
-                "Введите название:",
-                reply_markup=ReplyKeyboardMarkup(
-                    keyboard=[[KeyboardButton(text="❌ Отмена")]],
-                    resize_keyboard=True
-                )
-            )
-            return
-        
-        # Проверяем batch mode - показываем подтверждение
-        batch_step = data.get('batch_step')
-        if batch_step == 'confirm':
-            await state.update_data(selected_hashtags=selected)
-            
-            # Показываем финальное подтверждение с выбранными хештегами
-            posts = data.get('posts', [])
-            schedule = data.get('schedule', [])
-            time_category = data.get('time_category', 'minute')
-            time_value = data.get('time_value', 60)
-            
-            batch_service = BatchPostingService(MediaProcessor(callback.message.bot), callback.message.bot)
-            summary = batch_service.get_batch_summary(len(posts), schedule, time_category, time_value)
-            
-            await callback.message.edit_text(
-                summary + f"\n\n✅ Хештегов выбрано: <b>{len(selected)}</b>\n\n"
-                "<b>❓ Опубликовать пакет?</b>",
-                reply_markup=confirm_batch_final_keyboard(len(posts)),
-                parse_mode='HTML'
-            )
-            return
-        
-        # Обычная публикация (не batch)
-        await state.update_data(selected_hashtags=selected)
-        await publish_post(callback.message, state, callback.from_user.id)
+        await _publish_post_flow(callback, state)
         return
-
-    
-    # Переключение конкретного хештега
-    if action in all_hashtags:
-        if action in selected:
-            selected.remove(action)
-        else:
-            selected.append(action)
-        
-        await state.update_data(selected_hashtags=selected)
-        
-        await callback.message.edit_reply_markup(
-            reply_markup=hashtags_keyboard(
-                all_hashtags, selected,
-                callback.from_user.id, cat_key
-            )
-        )
-        return
-
-# ============ ПРИМЕНЕНИЕ ШАБЛОНОВ ХЕШТЕГОВ ============
-
-@router.callback_query(F.data.startswith("tmpl:"))
-async def apply_hashtag_template(callback: CallbackQuery, state: FSMContext):
-    """Применение шаблона хештегов"""
-    parts = callback.data.split(":")
-    action = parts[1]
-    
-    if action == "apply":
-        template_name = parts[2]
-        
+    if action == "templates":
         data = await state.get_data()
-        cat_key = data['category_key']
-        
-        config = load_config()
-        user_str = str(callback.from_user.id)
-        template_tags = config.get('hashtag_templates', {}).get(user_str, {}).get(cat_key, {}).get(template_name, [])
-        
-        if not template_tags:
-            await callback.answer("❌ Шаблон не найден", show_alert=True)
-            return
-        
-        # Применяем шаблон
-        selected = data.get('selected_hashtags', [])
-        
-        # Проверяем, активен ли уже этот шаблон
-        is_active = all(tag in selected for tag in template_tags)
-        
-        if is_active:
-            # Если активен - убираем эти теги
-            selected = [tag for tag in selected if tag not in template_tags]
-            await callback.answer(f"❌ Шаблон \"{template_name}\" снят")
-        else:
-            # Добавляем теги из шаблона
-            for tag in template_tags:
-                if tag not in selected:
-                    selected.append(tag)
-            await callback.answer(f"✅ Шаблон \"{template_name}\" применен")
-        
-        await state.update_data(selected_hashtags=selected)
-        
-        # Обновляем клавиатуру
         await callback.message.edit_reply_markup(
             reply_markup=hashtag_templates_keyboard(
-                callback.from_user.id, cat_key, selected
+                callback.from_user.id,
+                data["category_key"],
+                data.get("selected_hashtags", []),
             )
         )
+        await callback.answer()
+        return
+    if action == "back":
+        data = await state.get_data()
+        cat = data["category_data"]
+        await callback.message.edit_reply_markup(
+            reply_markup=hashtags_keyboard(
+                cat.get("hashtags", []),
+                data.get("selected_hashtags", []),
+                callback.from_user.id,
+                data["category_key"],
+            )
+        )
+        await callback.answer()
+        return
+    if action == "add_custom":
+        await callback.message.answer("✏️ Введите свой хештег (с #):")
+        await state.set_state(HashtagFlow.adding_custom)
+        await callback.answer()
+        return
+    if action == "save_template":
+        await callback.message.answer("💾 Введите название шаблона:")
+        await state.set_state(HashtagFlow.naming_template)
+        await callback.answer()
         return
 
-# ============ ДОБАВЛЕНИЕ ПОЛЬЗОВАТЕЛЬСКИХ ХЕШТЕГОВ ============
+    await _hashtag_toggle(callback, state)
+
+
+@router.callback_query(PostFlow.comic_hashtags, F.data.startswith("tag:"))
+async def hashtag_callback_comic(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":", 1)[1]
+    if action == "done":
+        # Вернуться к подтверждению комикса
+        data = await state.get_data()
+        await callback.message.answer(
+            "✅ Хештеги добавлены. Публикуем комикс?",
+            reply_markup=comic_confirm_keyboard(),
+        )
+        await callback.answer()
+        return
+    await _hashtag_toggle(callback, state)
+
+
+@router.callback_query(F.data.startswith("tmpl:apply:"))
+async def apply_template(callback: CallbackQuery, state: FSMContext):
+    template_name = callback.data.split(":", 2)[2]
+    data = await state.get_data()
+    config = load_config()
+    user_str = str(callback.from_user.id)
+    cat_key = data["category_key"]
+    tags = (
+        config.get("hashtag_templates", {})
+        .get(user_str, {})
+        .get(cat_key, {})
+        .get(template_name, [])
+    )
+    await state.update_data(selected_hashtags=tags)
+    cat = data["category_data"]
+    await callback.message.edit_reply_markup(
+        reply_markup=hashtags_keyboard(
+            cat.get("hashtags", []),
+            tags,
+            callback.from_user.id,
+            cat_key,
+        )
+    )
+    await callback.answer(f"✅ Шаблон «{template_name}» применён")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ХЕШТЕГИ — пользовательские / шаблоны
+# ──────────────────────────────────────────────────────────────────────────────
 
 @router.message(HashtagFlow.adding_custom)
-async def custom_hashtag_received(message: Message, state: FSMContext):
-    """Получен пользовательский хештег"""
-    if message.text == "❌ Отмена":
-        data = await state.get_data()
-        category_data = data['category_data']
-        all_hashtags = category_data.get('hashtags', [])
-        selected = data.get('selected_hashtags', [])
-        cat_key = data['category_key']
-        
-        await state.set_state(PostFlow.selecting_hashtags)
-        await message.answer(
-            "🏷 <b>Выберите хештеги:</b>",
-            reply_markup=hashtags_keyboard(
-                all_hashtags, selected,
-                message.from_user.id, cat_key
-            ),
-            parse_mode='HTML'
-        )
-        return
-    
-    # Валидация хештега
-    hashtag = message.text.strip()
-    
-    if not hashtag.startswith('#'):
-        await message.answer(
-            "❌ Хештег должен начинаться с #\n\n"
-            "Попробуйте еще раз:",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="❌ Отмена")]],
-                resize_keyboard=True
-            )
-        )
-        return
-    
-    if ' ' in hashtag:
-        await message.answer(
-            "❌ Хештег не должен содержать пробелов\n\n"
-            "Попробуйте еще раз:",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="❌ Отмена")]],
-                resize_keyboard=True
-            )
-        )
-        return
-    
-    # Добавляем хештег в категорию
-    data = await state.get_data()
-    category_data = data['category_data']
-    cat_key = data['category_key']
-    
-    config = load_config()
-    
-    # Находим и обновляем категорию
-    for participant_key, participant_data in config['participants'].items():
-        if participant_data.get('user_id') == message.from_user.id:
-            if cat_key in participant_data['categories']:
-                if hashtag not in participant_data['categories'][cat_key]['hashtags']:
-                    participant_data['categories'][cat_key]['hashtags'].append(hashtag)
-                    save_config(config)
-                    
-                    # Обновляем в state
-                    category_data['hashtags'].append(hashtag)
-                    await state.update_data(category_data=category_data)
-                    
-                    # Автоматически выбираем новый хештег
-                    selected = data.get('selected_hashtags', [])
-                    selected.append(hashtag)
-                    await state.update_data(selected_hashtags=selected)
-                    
-                    await message.answer(
-                        f"✅ Хештег <b>{hashtag}</b> добавлен и выбран!",
-                        parse_mode='HTML'
-                    )
-                else:
-                    # Хештег уже есть - просто выбираем его
-                    selected = data.get('selected_hashtags', [])
-                    if hashtag not in selected:
-                        selected.append(hashtag)
-                        await state.update_data(selected_hashtags=selected)
-                    
-                    await message.answer(
-                        f"ℹ️ Хештег <b>{hashtag}</b> уже существует и выбран!",
-                        parse_mode='HTML'
-                    )
-                
-                break
-    
-    # Возвращаемся к выбору хештегов
-    all_hashtags = category_data.get('hashtags', [])
-    selected = data.get('selected_hashtags', [])
-    
-    await state.set_state(PostFlow.selecting_hashtags)
-    await message.answer(
-        "🏷 <b>Выберите хештеги:</b>",
-        reply_markup=hashtags_keyboard(
-            all_hashtags, selected,
-            message.from_user.id, cat_key
-        ),
-        parse_mode='HTML'
-    )
+async def custom_hashtag_input(message: Message, state: FSMContext):
+    tag = message.text.strip()
+    if not tag.startswith("#"):
+        tag = "#" + tag
 
-# ============ СОХРАНЕНИЕ ШАБЛОНОВ ХЕШТЕГОВ ============
-
-@router.message(HashtagFlow.naming_template)
-async def save_hashtag_template(message: Message, state: FSMContext):
-    """Сохранение шаблона хештегов"""
-    if message.text == "❌ Отмена":
-        data = await state.get_data()
-        category_data = data['category_data']
-        all_hashtags = category_data.get('hashtags', [])
-        selected = data.get('selected_hashtags', [])
-        cat_key = data['category_key']
-        
-        await state.set_state(PostFlow.selecting_hashtags)
-        await message.answer(
-            "🏷 <b>Выберите хештеги:</b>",
-            reply_markup=hashtags_keyboard(
-                all_hashtags, selected,
-                message.from_user.id, cat_key
-            ),
-            parse_mode='HTML'
-        )
-        return
-    
-    template_name = message.text.strip()
     data = await state.get_data()
-    selected = data.get('selected_hashtags', [])
-    cat_key = data['category_key']
-    
-    # Сохраняем шаблон в config
+    selected = data.get("selected_hashtags", [])
+    if tag not in selected:
+        selected.append(tag)
+    await state.update_data(selected_hashtags=selected)
+
+    # Добавить тег в конфиг пользователя
     config = load_config()
     user_str = str(message.from_user.id)
-    
-    if 'hashtag_templates' not in config:
-        config['hashtag_templates'] = {}
-    
-    if user_str not in config['hashtag_templates']:
-        config['hashtag_templates'][user_str] = {}
-    
-    if cat_key not in config['hashtag_templates'][user_str]:
-        config['hashtag_templates'][user_str][cat_key] = {}
-    
-    config['hashtag_templates'][user_str][cat_key][template_name] = selected
-    save_config(config)
-    
+    cat_key = data["category_key"]
+    for part_data in config["participants"].values():
+        if part_data.get("user_id") == message.from_user.id:
+            if tag not in part_data["categories"].get(cat_key, {}).get("hashtags", []):
+                part_data["categories"][cat_key].setdefault("hashtags", []).append(tag)
+            break
+    with open("config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    cat = data["category_data"]
+    # Обновляем cat_data в state тоже
+    cat.setdefault("hashtags", [])
+    if tag not in cat["hashtags"]:
+        cat["hashtags"].append(tag)
+    await state.update_data(category_data=cat)
+
     await message.answer(
-        f"💾 Шаблон <b>\"{template_name}\"</b> сохранен!\n\n"
-        f"📊 Хештегов в шаблоне: {len(selected)}",
-        parse_mode='HTML'
-    )
-    
-    # Возвращаемся к выбору хештегов
-    category_data = data['category_data']
-    all_hashtags = category_data.get('hashtags', [])
-    
-    await state.set_state(PostFlow.selecting_hashtags)
-    await message.answer(
-        "🏷 <b>Выберите хештеги:</b>",
+        f"✅ Хештег {tag} добавлен",
         reply_markup=hashtags_keyboard(
-            all_hashtags, selected,
-            message.from_user.id, cat_key, show_templates=True
+            cat.get("hashtags", []),
+            selected,
+            message.from_user.id,
+            cat_key,
         ),
-        parse_mode='HTML'
     )
+    await state.set_state(PostFlow.selecting_hashtags)
 
 
-# ============ ПУБЛИКАЦИЯ ПОСТА ============
-
-async def publish_post(message: Message, state: FSMContext, user_id: int):
-    """Публикация готового поста"""
+@router.message(HashtagFlow.naming_template)
+async def template_name_input(message: Message, state: FSMContext):
+    name = message.text.strip()
     data = await state.get_data()
-    
-    media_files = data.get('media_files', [])
-    selected_hashtags = data.get('selected_hashtags', [])
-    category_data = data['category_data']
-    platform_id = data['platform_id']
-    topic = data.get('topic')
-    description = data.get('description', '')
-    
-    if not media_files:
-        await message.answer("❌ Нет файлов для публикации")
-        return
-    
-    # Обрабатываем медиа
-    processor = MediaProcessor(bot=message.bot)
+    selected = data.get("selected_hashtags", [])
+    cat_key = data["category_key"]
 
-    
-    await message.edit_text("⏳ Обработка файлов...")
-    
-    # Преобразуем media_files в нужный формат
-    media_to_process = [(mtype, fid) for mtype, fid, _ in media_files]
-    processed_media = await processor.process_batch(media_to_process)
-    
-    if not processed_media:
-        await message.edit_text("❌ Ошибка обработки файлов")
-        return
-    
-    # Формируем caption
-    caption = format_post_caption(category_data, selected_hashtags, platform_id, description)
-    
-    # Получаем chat_id и thread_id (тема). Важно: если topic указан, но thread_id битый/пустой — НЕ публикуем в Главную молча.
-    try:
-        chat_id, thread_id = resolve_chat_and_thread(platform_id, topic)
-    except Exception as e:
-        logger.error(f"❌ Неверная тема для публикации: platform={platform_id}, topic={topic} -> {e}")
-        await message.edit_text(f"❌ Ошибка: не найдена тема для категории.\n\n{e}")
-        return
-    # Публикуем
-    await message.edit_text("📤 Публикация...")
-    
-    try:
-        if len(processed_media) == 1:
-            success = await processor.send_single_media(
-                chat_id, processed_media[0][0], processed_media[0][1], caption, thread_id
-            )
-        else:
-            success = await processor.send_media_group(
-                chat_id, processed_media, caption, thread_id
-            )
-        
-        # Очищаем файлы
-        paths = [p for _, p in processed_media]
-        processor.cleanup_specific(paths)
-        
-        if success:
-            await message.edit_text("✅ Пост успешно опубликован!")
-            await message.answer("Что дальше?", reply_markup=after_post_keyboard())
-            await state.clear()
-        else:
-            await message.edit_text("❌ Ошибка публикации")
-    
-    except Exception as e:
-        logger.error(f"Ошибка публикации: {e}")
-        await message.edit_text(f"❌ Ошибка: {str(e)}")
+    config = load_config()
+    user_str = str(message.from_user.id)
+    config.setdefault("hashtag_templates", {}).setdefault(user_str, {}).setdefault(
+        cat_key, {}
+    )[name] = selected
+    with open("config.json", "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
 
-# ============ СОХРАНЕНИЕ В ОЧЕРЕДЬ С НАЗВАНИЕМ ============
-
-@router.message(PostFlow.selecting_hashtags)
-async def save_to_queue_with_name(message: Message, state: FSMContext):
-    """Сохранение в очередь после выбора хештегов"""
-    data = await state.get_data()
-    saving_to = data.get('saving_to')
-    
-    if saving_to != 'queue':
-        return
-    
-    if message.text == "❌ Отмена":
-        await cmd_start(message, state)
-        return
-    
-    name = message.text
-    
-    queue_mgr.add_to_queue(
-        user_id=message.from_user.id,
-        name=name,
-        category_key=data['category_key'],
-        category_data=data['category_data'],
-        platform_id=data['platform_id'],
-        media_files=data.get('media_files', []),
-        selected_hashtags=data.get('selected_hashtags', []),
-        description=data.get('description', ''),
-        topic=data.get('topic')
-    )
-    
+    cat = data["category_data"]
     await message.answer(
-        f"📥 Добавлено в очередь!\n\n"
-        f"📄 Название: <b>{name}</b>\n"
-        f"📊 Хештегов: {len(data.get('selected_hashtags', []))}",
-        reply_markup=main_menu(),
-        parse_mode='HTML'
+        f"💾 Шаблон «{name}» сохранён ({len(selected)} тегов)",
+        reply_markup=hashtags_keyboard(
+            cat.get("hashtags", []),
+            selected,
+            message.from_user.id,
+            cat_key,
+        ),
     )
-    await state.clear()
+    await state.set_state(PostFlow.selecting_hashtags)
 
-# ============ ПАКЕТНАЯ ЗАГРУЗКА ============
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ПУБЛИКАЦИЯ ПОСТА
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _publish_post_flow(callback: CallbackQuery, state: FSMContext):
+    """Обрабатывает нажатие «Готово» в выборе хештегов → публикует пост."""
+    data = await state.get_data()
+    selected = data.get("selected_hashtags", [])
+    if not selected:
+        await callback.answer("⚠️ Выберите хотя бы один хештег!", show_alert=True)
+        return
+
+    await callback.message.answer("⏳ Публикую пост...")
+    await callback.answer()
+
+    mp = get_media_processor(callback.bot)
+    config = load_config()
+    cat = data["category_data"]
+    platform_id = data["platform_id"]
+    chat_id = config["platforms"][platform_id]["chat_id"]
+    thread_id = None
+    if data.get("topic"):
+        thread_id = (
+            config["platforms"][platform_id]["topics"]
+            .get(data["topic"], {})
+            .get("thread_id")
+        )
+
+    processed = await mp.process_batch(data["media_files"])
+    if not processed:
+        await callback.message.answer("❌ Не удалось обработать медиафайлы.")
+        return
+
+    # Формируем caption
+    emoji_row = cat.get("emoji_row", "")
+    invite_link = config["platforms"][platform_id].get("invite_link", "")
+    hashtag_lines = [
+        " ".join(selected[i : i + 4]) for i in range(0, len(selected), 4)
+    ]
+    caption = (
+        f"{cat['emoji']} {cat['name'].upper()} {cat['emoji']}\n\n"
+        f"{emoji_row}\n"
+        + "\n".join(hashtag_lines)
+        + f"\n{emoji_row}\n\n"
+        f"↘️⬇️↙️\n"
+        f'<a href="{invite_link}">Ссылка для друга</a>'
+    )
+
+    if len(processed) == 1:
+        mt, fp = processed[0]
+        await mp.send_single_media(chat_id, mt, fp, caption, thread_id)
+    else:
+        await mp.send_media_group(chat_id, processed, caption, thread_id)
+
+    mp.cleanup_specific([fp for _, fp in processed])
+
+    await state.clear()
+    await callback.message.answer("✅ Пост опубликован!", reply_markup=after_post_keyboard())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ПАКЕТНАЯ ЗАГРУЗКА
+# ──────────────────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📦 Пакетная загрузка")
-async def batch_upload_start(message: Message, state: FSMContext):
-    """Начало пакетной загрузки"""
+async def batch_start(message: Message, state: FSMContext):
+    if not _is_authorized(message.from_user.id):
+        return
     await state.clear()
-    await state.set_state(PostFlow.selecting_category)
-    await state.update_data(is_batch_mode=True)
     await message.answer(
-        "📦 <b>Пакетная загрузка</b>\n\n"
-        "📁 Выберите категорию:",
+        "📦 Режим пакетной загрузки\n\nВыберите категорию:",
         reply_markup=categories_keyboard(message.from_user.id),
-        parse_mode='HTML'
     )
+    await state.set_state(PostFlow.selecting_category)
+    await state.update_data(batch_mode=True)
 
-@router.callback_query(F.data.startswith("files_per_post:"))
-async def batch_files_per_post_selected(callback: CallbackQuery, state: FSMContext):
-    """Выбрано количество файлов в посте"""
-    files_per_post = int(callback.data.split(":")[1])
-    
+
+@router.message(PostFlow.batch_uploading, F.photo | F.video)
+async def batch_media_received(message: Message, state: FSMContext):
     data = await state.get_data()
-    media_files = data.get('media_files', [])
-    posts_count = len(media_files) // files_per_post + (1 if len(media_files) % files_per_post else 0)
-    
-    await state.update_data(
-        files_per_post=files_per_post,
-        batch_step='time_category'
-    )
-    
-    await callback.message.edit_text(
-        f"✅ Файлов в посте: <b>{files_per_post}</b>\n"
-        f"📊 Получится постов: <b>{posts_count}</b>\n\n"
-        "⏰ За какой период публиковать?",
-        reply_markup=batch_schedule_keyboard(),
-        parse_mode='HTML'
-    )
+    media_files = data.get("media_files", [])
 
-@router.callback_query(F.data.startswith("time:category:"))
-async def batch_time_category(callback: CallbackQuery, state: FSMContext):
-    """Выбрана единица времени"""
-    time_cat = callback.data.split(":")[-1]
-    
-    await state.update_data(
-        time_category=time_cat,
-        batch_step='time_value'
-    )
-    
-    await callback.message.edit_text(
-        "⏱ Выберите длительность:",
-        reply_markup=time_options_keyboard(time_cat)
-    )
+    if message.photo:
+        media_files.append(("photo", message.photo[-1].file_id))
+    elif message.video:
+        media_files.append(("video", message.video.file_id))
 
-@router.callback_query(F.data == "time:back")
-async def batch_time_back(callback: CallbackQuery, state: FSMContext):
-    """Назад к выбору единицы времени"""
-    await state.update_data(batch_step='time_category')
-    
-    await callback.message.edit_text(
-        "⏰ За какой период публиковать?",
-        reply_markup=batch_schedule_keyboard()
-    )
+    await state.update_data(media_files=media_files)
+    count = len(media_files)
 
-@router.callback_query(F.data.startswith("schedule:"))
-async def batch_schedule_selected(callback: CallbackQuery, state: FSMContext):
-    """Выбрано расписание"""
-    parts = callback.data.split(":")
-    
-    if parts[1] == "cancel":
-        await callback.message.edit_text("❌ Отменено")
-        await callback.message.answer("Что дальше?", reply_markup=main_menu())
-        await state.clear()
+    config = load_config()
+    threshold = config.get("posting", {}).get("upload_feedback_threshold", 5)
+    if count % threshold == 0 or count == 1:
+        await message.answer(
+            f"✅ Загружено: {count} файлов",
+            reply_markup=media_upload_keyboard(count),
+        )
+
+
+@router.message(PostFlow.batch_uploading, F.text.startswith("➡️ Далее"))
+async def batch_next(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("media_files"):
+        await message.answer("⚠️ Загрузите хотя бы один файл.")
         return
-    
-    time_category = parts[1]
-    time_value = int(parts[2])
-    
-    data = await state.get_data()
-    media_files = data.get('media_files', [])
-    files_per_post = data.get('files_per_post', 1)
-    
-    # Разбиваем на посты
-    posts = []
-    for i in range(0, len(media_files), files_per_post):
-        posts.append(media_files[i:i + files_per_post])
-    
-    posts_count = len(posts)
-    
-    # Создаем расписание
-    batch_service = BatchPostingService(MediaProcessor(callback.message.bot), callback.message.bot)
-    schedule = batch_service.generate_schedule(posts_count, time_category, time_value)
-    
-    # Сохраняем данные
-    await state.update_data(
-        time_category=time_category,
-        time_value=time_value,
-        schedule=schedule,
-        posts=posts,
-        batch_step='confirm'
-    )
-    
-    # Показываем summary и спрашиваем про перемешивание
-    summary = batch_service.get_batch_summary(posts_count, schedule, time_category, time_value)
-    
-    await callback.message.edit_text(
-        summary + "\n\n<b>🔀 Перемешать посты?</b>\n\n"
-        "➡️ <i>Нет</i> - посты будут публиковаться в том порядке, в котором вы их загрузили\n"
-        "🔀 <i>Да</i> - порядок постов будет случайным",
-        reply_markup=batch_shuffle_keyboard(),
-        parse_mode='HTML'
-    )
 
-
-@router.callback_query(F.data.startswith("shuffle:"))
-async def batch_shuffle_selected(callback: CallbackQuery, state: FSMContext):
-    """Выбор перемешивания постов"""
-    action = callback.data.split(":")[1]
-    
-    if action == "cancel":
-        await callback.message.edit_text("❌ Отменено")
-        await callback.message.answer("Что дальше?", reply_markup=main_menu())
-        await state.clear()
-        return
-    
-    # Сохраняем выбор
-    shuffle = (action == "yes")
-    await state.update_data(shuffle=shuffle)
-    
-    data = await state.get_data()
-    posts = data.get('posts', [])
-    schedule = data.get('schedule', [])
-    time_category = data.get('time_category', 'minute')
-    time_value = data.get('time_value', 60)
-    
-    # Показываем summary с выбором и сразу переходим к хештегам
-    batch_service = BatchPostingService(MediaProcessor(callback.message.bot), callback.message.bot)
-    summary = batch_service.get_batch_summary(len(posts), schedule, time_category, time_value)
-    
-    shuffle_text = "🔀 Да, перемешать" if shuffle else "➡️ Нет, по порядку"
-    
-    # Редактируем сообщение — убираем кнопки shuffle, показываем итог
-    await callback.message.edit_text(
-        summary + f"\n✅ Порядок: <b>{shuffle_text}</b>",
-        parse_mode='HTML'
-    )
-    
-    # Переходим к выбору хештегов
-    category_data = data['category_data']
-    all_hashtags = category_data.get('hashtags', [])
-    cat_key = data['category_key']
-    
-    await callback.message.answer(
-        "🏷 <b>Шаг 4/4 — Выберите хештеги для всех постов:</b>\n\n"
-        "💡 После нажатия ✔️ Готово появится кнопка публикации",
+    cat = data["category_data"]
+    await message.answer(
+        "🏷 Выберите хештеги для пакета:",
         reply_markup=hashtags_keyboard(
-            all_hashtags, [],
-            callback.from_user.id, cat_key
+            cat.get("hashtags", []),
+            [],
+            message.from_user.id,
+            data["category_key"],
         ),
-        parse_mode='HTML'
     )
     await state.set_state(PostFlow.selecting_hashtags)
+    await state.update_data(after_hashtags="batch_schedule")
 
 
-@router.callback_query(F.data == "batch:confirm_publish")
-async def batch_publish_confirmed(callback: CallbackQuery, state: FSMContext):
-    """Подтверждение публикации пакета — проверяем конфликт с активным"""
-    data = await state.get_data()
-    posts = data.get('posts', [])
-    schedule = data.get('schedule', [])
-
-    if not posts or not schedule:
-        await callback.answer("❌ Ошибка данных", show_alert=True)
-        return
-
-    category_key = data.get('category_key', '')
-
-    # Спрашиваем только если В ЭТОЙ ЖЕ КАТЕГОРИИ уже идёт пакетная отправка
-    if queue_mgr.running and queue_mgr.is_category_active(category_key):
-        active_info = queue_mgr.get_active_info_for_category(category_key)
-        active_name = active_info.get("name", "текущий пакет") if active_info else "текущий пакет"
-        active_progress = queue_mgr.get_progress_for_category(category_key)
-        cat_data = data.get('category_data', {})
-        cat_label = f"{cat_data.get('emoji','')} {cat_data.get('name', category_key)}"
-
-        await callback.message.edit_text(
-            f"⚠️ <b>В категории {cat_label} уже идёт пакетная отправка!</b>\n\n"
-            f"▶️ <b>{active_name}</b>"
-            + (f"\n📊 Прогресс: <i>{active_progress}</i>" if active_progress else "") +
-            f"\n\n"
-            f"Как добавить новый пакет <b>({len(posts)} постов)</b>?\n\n"
-            f"🔀 <b>Совместить</b> — посты будут чередоваться\n"
-            f"📅 <b>После</b> — новый пакет начнётся когда текущий закончится",
-            reply_markup=batch_conflict_keyboard(),
-            parse_mode='HTML'
-        )
-        return
-
-    # Конфликта нет — добавляем и сразу запускаем
-    await _do_add_batch_to_queue(callback, state, mode="after")
-
-
-@router.callback_query(F.data.startswith("batch_conflict:"))
-async def batch_conflict_choice(callback: CallbackQuery, state: FSMContext):
-    """Обработка выбора при конфликте пакетов"""
-    action = callback.data.split(":")[1]
-    if action == "cancel":
-        await callback.message.edit_text("❌ Добавление пакета отменено")
-        await callback.message.answer("Что дальше?", reply_markup=after_post_keyboard())
-        await state.clear()
-        return
-    await _do_add_batch_to_queue(callback, state, mode=action)
-
-
-async def _do_add_batch_to_queue(callback: CallbackQuery, state: FSMContext, mode: str):
-    """Добавляет пакет в очередь. mode: 'after' | 'interleave'"""
-    data = await state.get_data()
-
-    posts = data.get('posts', [])
-    category_data = data['category_data']
-    category_key = data['category_key']
-    platform_id = data['platform_id']
-    selected_hashtags = data.get('selected_hashtags', [])
-    schedule = data.get('schedule', [])
-    topic = data.get('topic')
-    time_category = data.get('time_category', 'minute')
-    time_value = data.get('time_value', 60)
-    shuffle = data.get('shuffle', False)
-
-    await callback.message.edit_text("⏳ Добавление пакета в очередь...")
-
-    posts_formatted = [[(mtype, fid) for mtype, fid, *_ in post] for post in posts]
-
-    schedule_dt = []
-    for s in schedule:
-        if isinstance(s, str):
-            schedule_dt.append(datetime.fromisoformat(s))
-        elif isinstance(s, datetime):
-            schedule_dt.append(s)
-        else:
-            schedule_dt.append(s)
-
-    if mode == "interleave" and queue_mgr.is_category_active(category_key):
-        batch_id = queue_mgr.merge_batch_into_active(
-            user_id=callback.from_user.id,
-            category_data=category_data, category_key=category_key,
-            platform_id=platform_id, posts=posts_formatted,
-            selected_hashtags=selected_hashtags, topic=topic,
-            time_period=time_category, time_value=time_value, shuffle=shuffle,
-        )
-        mode_emoji = "🔀 Совмещён с текущим пакетом"
-    else:
-        batch_id = queue_mgr.add_batch_to_queue(
-            user_id=callback.from_user.id,
-            category_data=category_data, category_key=category_key,
-            platform_id=platform_id, posts=posts_formatted,
-            selected_hashtags=selected_hashtags, schedule=schedule_dt,
-            topic=topic, time_period=time_category, time_value=time_value, shuffle=shuffle,
-        )
-        if queue_mgr.is_category_active(category_key):
-            mode_emoji = "📅 Добавлен после текущего (та же категория)"
-        else:
-            mode_emoji = "✅ Добавлен — публикация началась"
-
-    # Запускаем задачу именно для этой категории (параллельно с другими)
-    media_proc = MediaProcessor(callback.message.bot)
-    await queue_mgr.ensure_category_running(category_key, media_proc, callback.message.bot)
-
-    first_dt = schedule_dt[0] if schedule_dt else datetime.now()
-    last_dt = schedule_dt[-1] if len(schedule_dt) > 1 else first_dt
-
-    await callback.message.edit_text(
-        f"✅ <b>Пакет добавлен!</b>\n\n"
-        f"📦 ID: <b>#{batch_id[:4]}</b>\n"
-        f"📊 Постов: <b>{len(posts)}</b>\n"
-        f"🔀 Перемешан: <b>{'Да' if shuffle else 'Нет'}</b>\n"
-        f"{mode_emoji}\n\n"
-        f"🕐 Первый: <b>{first_dt.strftime('%d.%m %H:%M')}</b>\n"
-        f"🕐 Последний: <b>{last_dt.strftime('%d.%m %H:%M')}</b>",
-        parse_mode='HTML'
-    )
-    await callback.message.answer("Что дальше?", reply_markup=after_post_keyboard())
+@router.message(PostFlow.batch_uploading, F.text == "❌ Отмена")
+async def batch_cancel(message: Message, state: FSMContext):
     await state.clear()
+    await message.answer("❌ Отменено.", reply_markup=main_menu())
 
 
-# ============ УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЬСКИМИ ХЕШТЕГАМИ ============
+# ──────────────────────────────────────────────────────────────────────────────
+#  ПАКЕТНОЕ РАСПИСАНИЕ
+# ──────────────────────────────────────────────────────────────────────────────
 
-@router.message(F.text == "#️⃣ Мои хештеги")
-async def my_hashtags_menu(message: Message, state: FSMContext):
-    """Меню управления хештегами"""
-    await message.answer(
-        "#️⃣ <b>Управление хештегами</b>\n\n"
-        "Здесь вы можете:\n"
-        "• Просматривать сохраненные шаблоны\n"
-        "• Управлять своими хештегами\n"
-        "• Удалять ненужные шаблоны",
-        reply_markup=my_hashtags_menu_keyboard(message.from_user.id),
-        parse_mode='HTML'
+@router.callback_query(PostFlow.batch_schedule, F.data.startswith("time:category:"))
+async def batch_time_category(callback: CallbackQuery, state: FSMContext):
+    category = callback.data.split(":")[-1]
+    await state.update_data(time_category=category)
+    await callback.message.edit_reply_markup(reply_markup=time_options_keyboard(category))
+    await callback.answer()
+
+
+@router.callback_query(PostFlow.batch_schedule, F.data == "time:back")
+async def batch_time_back(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=batch_schedule_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(PostFlow.batch_schedule, F.data.startswith("schedule:"))
+async def batch_schedule_value(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    if parts[1] == "cancel":
+        await state.clear()
+        await callback.message.answer("❌ Отменено.", reply_markup=main_menu())
+        await callback.answer()
+        return
+
+    time_period = parts[1]
+    time_value = int(parts[2])
+    await state.update_data(time_period=time_period, time_value=time_value)
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        "📊 Сколько файлов в одном посте?",
+        reply_markup=files_per_post_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(PostFlow.batch_schedule, F.data.startswith("files_per_post:"))
+async def batch_files_per_post(callback: CallbackQuery, state: FSMContext):
+    files_per_post = int(callback.data.split(":")[-1])
+    data = await state.get_data()
+
+    bs = get_batch_service(callback.bot)
+    media_files = data.get("media_files", [])
+    posts = bs.split_into_posts(media_files, files_per_post)
+    schedule = bs.generate_schedule(
+        len(posts), data["time_period"], data["time_value"]
     )
 
-@router.callback_query(F.data.startswith("myhash:"))
-async def my_hashtags_actions(callback: CallbackQuery, state: FSMContext):
-    """Действия в меню хештегов"""
-    parts = callback.data.split(":")
-    action = parts[1]
-    
-    if action == "back":
-        await callback.message.edit_text("👋 Главное меню")
-        await callback.message.answer("Выберите действие:", reply_markup=main_menu())
-        return
-    
-    if action == "menu":
-        await callback.message.edit_text(
-            "#️⃣ <b>Управление хештегами</b>\n\n"
-            "Здесь вы можете:\n"
-            "• Просматривать сохраненные шаблоны\n"
-            "• Управлять своими хештегами\n"
-            "• Удалять ненужные шаблоны",
-            reply_markup=my_hashtags_menu_keyboard(callback.from_user.id),
-            parse_mode='HTML'
-        )
-        return
-    
-    if action == "help":
-        help_text = (
-            "ℹ️ <b>Как использовать хештеги</b>\n\n"
-            "<b>📋 Шаблоны хештегов:</b>\n"
-            "Это сохраненные наборы хештегов для быстрого применения.\n\n"
-            "<b>Как создать шаблон:</b>\n"
-            "1. При выборе хештегов нажмите '💾 Сохранить как шаблон'\n"
-            "2. Введите название\n"
-            "3. Шаблон сохранен!\n\n"
-            "<b>Как использовать:</b>\n"
-            "При выборе хештегов нажмите '📋 Мои шаблоны' и выберите нужный.\n\n"
-            "<b>➕ Свои хештеги:</b>\n"
-            "При выборе хештегов нажмите '➕ Свой хештег' и введите его.\n"
-            "Хештег сохранится в категории навсегда!"
-        )
-        await callback.message.edit_text(
-            help_text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="myhash:menu")]
-            ]),
-            parse_mode='HTML'
-        )
-        return
-    
-    if action == "templates":
-        await callback.message.edit_text(
-            "📋 <b>Мои шаблоны хештегов</b>\n\n"
-            "Выберите категорию:",
-            reply_markup=user_templates_list_keyboard(callback.from_user.id),
-            parse_mode='HTML'
-        )
-        return
-    
-    if action == "cat":
-        category_key = parts[2]
-        await callback.message.edit_text(
-            "📋 <b>Шаблоны категории</b>\n\n"
-            "Выберите шаблон:",
-            reply_markup=category_templates_keyboard(callback.from_user.id, category_key),
-            parse_mode='HTML'
-        )
-        return
-    
-    if action == "view":
-        category_key = parts[2]
-        template_name = ":".join(parts[3:])  # На случай если в названии есть двоеточия
-        
-        config = load_config()
-        user_str = str(callback.from_user.id)
-        template_tags = config.get('hashtag_templates', {}).get(user_str, {}).get(category_key, {}).get(template_name, [])
-        
-        tags_text = '\n'.join(template_tags)
-        
-        await callback.message.edit_text(
-            f"📋 <b>Шаблон: {template_name}</b>\n\n"
-            f"📊 Хештегов: {len(template_tags)}\n\n"
-            f"{tags_text}",
-            reply_markup=template_actions_keyboard(category_key, template_name),
-            parse_mode='HTML'
-        )
-        return
-    
-    if action == "delete":
-        category_key = parts[2]
-        template_name = ":".join(parts[3:])
-        
-        config = load_config()
-        user_str = str(callback.from_user.id)
-        
-        if user_str in config.get('hashtag_templates', {}):
-            if category_key in config['hashtag_templates'][user_str]:
-                if template_name in config['hashtag_templates'][user_str][category_key]:
-                    del config['hashtag_templates'][user_str][category_key][template_name]
-                    save_config(config)
-                    
-                    await callback.answer("🗑️ Шаблон удален")
-                    
-                    # Возвращаемся к списку шаблонов категории
-                    await callback.message.edit_text(
-                        "📋 <b>Шаблоны категории</b>\n\n"
-                        "Выберите шаблон:",
-                        reply_markup=category_templates_keyboard(callback.from_user.id, category_key),
-                        parse_mode='HTML'
-                    )
-                    return
-        
-        await callback.answer("❌ Шаблон не найден", show_alert=True)
+    summary = bs.get_batch_summary(len(posts), schedule, data["time_period"], data["time_value"])
+    await state.update_data(
+        files_per_post=files_per_post,
+        posts_count=len(posts),
+        schedule=[s.isoformat() for s in schedule],
+    )
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        summary,
+        reply_markup=confirm_batch_final_keyboard(len(posts)),
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.callback_query(PostFlow.batch_schedule, F.data == "batch:confirm_publish")
+async def batch_confirm_publish(callback: CallbackQuery, state: FSMContext):
+    from datetime import datetime
+
+    data = await state.get_data()
+    bs = get_batch_service(callback.bot)
+    mp = get_media_processor(callback.bot)
+
+    media_files = data.get("media_files", [])
+    files_per_post = data.get("files_per_post", 1)
+
+    # Скачиваем и обрабатываем все файлы
+    await callback.message.answer("⏳ Обрабатываю файлы...")
+    processed = await mp.process_batch(media_files)
+
+    if not processed:
+        await callback.message.answer("❌ Не удалось обработать медиафайлы.")
+        await callback.answer()
         return
 
-# ============ ЧЕРНОВИКИ ============
+    posts = bs.split_into_posts(processed, files_per_post)
+    schedule = [datetime.fromisoformat(s) for s in data["schedule"]]
+
+    config = load_config()
+    cat = data["category_data"]
+    platform_id = data["platform_id"]
+    thread_id = None
+    if data.get("topic"):
+        thread_id = (
+            config["platforms"][platform_id]["topics"]
+            .get(data["topic"], {})
+            .get("thread_id")
+        )
+
+    count = await bs.schedule_batch(
+        posts=posts,
+        category_data=cat,
+        platform_id=platform_id,
+        hashtags=data.get("selected_hashtags", []),
+        schedule=schedule,
+        thread_id=thread_id,
+    )
+
+    await state.clear()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        f"✅ Пакет запланирован: {count} постов",
+        reply_markup=after_post_keyboard(),
+    )
+    await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ЧЕРНОВИКИ
+# ──────────────────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "💾 Черновики")
-async def show_drafts(message: Message, state: FSMContext):
-    """Показать черновики"""
-    user_drafts = draft_mgr.get_user_drafts(message.from_user.id)
-    
-    if not user_drafts:
-        await message.answer(
-            "📂 <b>Черновики пусты</b>\n\n"
-            "Черновики создаются через кнопку '💾 В черновик' при загрузке медиа.",
-            reply_markup=main_menu(),
-            parse_mode='HTML'
-        )
+async def drafts_menu(message: Message, state: FSMContext):
+    if not _is_authorized(message.from_user.id):
         return
-    
+    await state.clear()
+    dm = get_draft_manager()
+    drafts = dm.get_user_drafts(message.from_user.id)
+    if not drafts:
+        await message.answer("📭 У вас нет черновиков.", reply_markup=main_menu())
+        return
     await message.answer(
-        f"📂 <b>Ваши черновики ({len(user_drafts)})</b>\n\n"
-        "Выберите черновик:",
-        reply_markup=drafts_list_keyboard(user_drafts),
-        parse_mode='HTML'
+        f"💾 <b>Черновики</b> ({len(drafts)}):",
+        reply_markup=drafts_list_keyboard(drafts),
+        parse_mode="HTML",
     )
+
 
 @router.callback_query(F.data.startswith("dr:"))
-async def draft_actions(callback: CallbackQuery, state: FSMContext):
-    """Действия с черновиками"""
-    parts = callback.data.split(":")
+async def draft_callback(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":", 2)
     action = parts[1]
-    
+    draft_id = parts[2] if len(parts) > 2 else None
+
+    dm = get_draft_manager()
+
     if action == "back":
-        await callback.message.edit_text("👋 Главное меню")
-        await callback.message.answer("Выберите действие:", reply_markup=main_menu())
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("🏠 Главное меню", reply_markup=main_menu())
+        await callback.answer()
         return
-    
+
     if action == "list":
-        user_drafts = draft_mgr.get_user_drafts(callback.from_user.id)
-        if user_drafts:
-            await callback.message.edit_text(
-                f"📂 <b>Ваши черновики ({len(user_drafts)})</b>\n\n"
-                "Выберите черновик:",
-                reply_markup=drafts_list_keyboard(user_drafts),
-                parse_mode='HTML'
-            )
-        else:
-            await callback.message.edit_text("📂 Черновики пусты")
-            await callback.message.answer("Что дальше?", reply_markup=main_menu())
+        drafts = dm.get_user_drafts(callback.from_user.id)
+        await callback.message.edit_reply_markup(
+            reply_markup=drafts_list_keyboard(drafts) if drafts else None
+        )
+        await callback.answer()
         return
-    
+
     if action == "open":
-        draft_id = parts[2]
-        draft = draft_mgr.get_draft(draft_id)
-        
+        draft = dm.get_draft(draft_id)
         if not draft:
-            await callback.answer("❌ Черновик не найден", show_alert=True)
+            await callback.answer("❌ Черновик не найден")
             return
-        
-        info = draft_mgr.get_draft_info(draft_id)
-        
-        await callback.message.edit_text(
-            info,
-            reply_markup=draft_action_keyboard(draft_id),
-            parse_mode='HTML'
+        info = dm.get_draft_info(draft_id)
+        await callback.message.answer(
+            info, reply_markup=draft_action_keyboard(draft_id), parse_mode="HTML"
         )
+        await callback.answer()
         return
-    
-    if action == "pub":
-        draft_id = parts[2]
-        draft = draft_mgr.get_draft(draft_id)
-        
-        if not draft:
-            await callback.answer("❌ Черновик не найден", show_alert=True)
-            return
-        
-        await callback.answer("📤 Публикуем...")
-        
-        # Проверяем, это комикс или обычный пост
-        is_comic = draft.get('is_comic', False)
-        
-        if is_comic:
-            # Публикация комикса
-            caption = format_comic_post(
-                draft['category_data'],
-                draft.get('comic_title', ''),
-                draft.get('comic_link', ''),
-                draft['selected_hashtags'],
-                draft['platform_id']
-            )
-            
-            # Получаем chat_id и thread_id (тема)
-            try:
-                chat_id, thread_id = resolve_chat_and_thread(draft['platform_id'], draft.get('topic'))
-            except Exception as e:
-                logger.error(f"❌ Неверная тема для публикации черновика: platform={draft.get('platform_id')}, topic={draft.get('topic')} -> {e}")
-                await callback.message.edit_text(f"❌ Ошибка: не найдена тема для черновика.\n\n{e}")
-                return
 
-            try:
-                kwargs = dict(
-                    chat_id=chat_id,
-                    text=caption,
-                    parse_mode='HTML',
-                    disable_web_page_preview=False
-                )
-                if thread_id is not None:
-                    kwargs["message_thread_id"] = thread_id
-
-                await callback.bot.send_message(**kwargs)
-                draft_mgr.delete_draft(draft_id)
-                await callback.message.edit_text("✅ Комикс опубликован и удален из черновиков!")
-                await callback.message.answer("Что дальше?", reply_markup=main_menu())
-            except Exception as e:
-                logger.error(f"Ошибка публикации комикса из черновика: {e}")
-                await callback.message.edit_text(f"❌ Ошибка публикации: {str(e)}")
-            return
-        
-        # Публикация обычного поста
-        processor = MediaProcessor(callback.message.bot)
-        
-        media_to_process = [(mtype, fid) for mtype, fid, _ in draft['media_files']]
-        processed_media = await processor.process_batch(media_to_process)
-        
-        if not processed_media:
-            await callback.message.edit_text("❌ Ошибка обработки файлов")
-            return
-        
-        # Получаем chat_id и thread_id (тема)
-        try:
-            chat_id, thread_id = resolve_chat_and_thread(draft['platform_id'], draft.get('topic'))
-        except Exception as e:
-            logger.error(f"❌ Неверная тема для публикации черновика: platform={draft.get('platform_id')}, topic={draft.get('topic')} -> {e}")
-            await callback.message.edit_text(f"❌ Ошибка: не найдена тема для черновика.\n\n{e}")
-            return
-        caption = format_post_caption(
-            draft['category_data'],
-            draft['selected_hashtags'],
-            draft['platform_id'],
-            draft.get('description', '')
-        )
-        
-        success = False
-        if len(processed_media) == 1:
-            success = await processor.send_single_media(
-                chat_id, processed_media[0][0], processed_media[0][1], caption, thread_id
-            )
-        else:
-            success = await processor.send_media_group(
-                chat_id, processed_media, caption, thread_id
-            )
-        
-        paths = [p for _, p in processed_media]
-        processor.cleanup_specific(paths)
-        
-        if success:
-            draft_mgr.delete_draft(draft_id)
-            await callback.message.edit_text("✅ Черновик опубликован и удален!")
-            await callback.message.answer("Что дальше?", reply_markup=main_menu())
-        else:
-            await callback.message.edit_text("❌ Ошибка публикации")
-        return
-    
-    if action == "toq":
-        draft_id = parts[2]
-        draft = draft_mgr.get_draft(draft_id)
-        
-        if not draft:
-            await callback.answer("❌ Черновик не найден", show_alert=True)
-            return
-        
-        queue_mgr.add_to_queue(
-            user_id=callback.from_user.id,
-            name=draft['name'],
-            category_key=draft['category_key'],
-            category_data=draft['category_data'],
-            platform_id=draft['platform_id'],
-            media_files=draft['media_files'],
-            selected_hashtags=draft['selected_hashtags'],
-            description=draft.get('description', ''),
-            topic=draft.get('topic'),
-            is_comic=draft.get('is_comic', False),
-            comic_link=draft.get('comic_link', ''),
-            comic_title=draft.get('comic_title', '')
-        )
-        
-        draft_mgr.delete_draft(draft_id)
-        await callback.answer("✅ Добавлено в очередь")
-        await callback.message.edit_text("✅ Черновик перемещен в очередь!")
-        await callback.message.answer("Что дальше?", reply_markup=main_menu())
-        return
-    
     if action == "del":
-        draft_id = parts[2]
-        draft_mgr.delete_draft(draft_id)
-        await callback.answer("🗑️ Удалено")
-        
-        user_drafts = draft_mgr.get_user_drafts(callback.from_user.id)
-        if user_drafts:
-            await callback.message.edit_text(
-                f"📂 <b>Ваши черновики ({len(user_drafts)})</b>\n\nВыберите черновик:",
-                reply_markup=drafts_list_keyboard(user_drafts),
-                parse_mode='HTML'
+        dm.delete_draft(draft_id)
+        await callback.answer("🗑️ Черновик удалён")
+        drafts = dm.get_user_drafts(callback.from_user.id)
+        if drafts:
+            await callback.message.edit_reply_markup(
+                reply_markup=drafts_list_keyboard(drafts)
             )
         else:
-            await callback.message.edit_text("📂 Черновики пусты")
-            await callback.message.answer("Что дальше?", reply_markup=main_menu())
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("📭 Черновиков больше нет.", reply_markup=main_menu())
         return
 
+    if action == "pub":
+        draft = dm.get_draft(draft_id)
+        if not draft:
+            await callback.answer("❌ Черновик не найден")
+            return
+        await callback.message.answer("⏳ Публикую черновик...")
+        mp = get_media_processor(callback.bot)
+        config = load_config()
+        platform_id = draft["platform_id"]
+        chat_id = config["platforms"][platform_id]["chat_id"]
+        thread_id = None
+        if draft.get("topic"):
+            thread_id = (
+                config["platforms"][platform_id]["topics"]
+                .get(draft["topic"], {})
+                .get("thread_id")
+            )
 
-# ============ ОЧЕРЕДЬ ============
+        processed = await mp.process_batch(draft["media_files"])
+        if not processed:
+            await callback.message.answer("❌ Не удалось обработать медиафайлы.")
+            await callback.answer()
+            return
+
+        cat = draft["category_data"]
+        emoji_row = cat.get("emoji_row", "")
+        invite_link = config["platforms"][platform_id].get("invite_link", "")
+        selected = draft.get("selected_hashtags", [])
+        hashtag_lines = [" ".join(selected[i : i + 4]) for i in range(0, len(selected), 4)]
+        caption = (
+            f"{cat['emoji']} {cat['name'].upper()} {cat['emoji']}\n\n"
+            f"{emoji_row}\n"
+            + "\n".join(hashtag_lines)
+            + f"\n{emoji_row}\n\n"
+            f"↘️⬇️↙️\n"
+            f'<a href="{invite_link}">Ссылка для друга</a>'
+        )
+
+        if len(processed) == 1:
+            mt, fp = processed[0]
+            await mp.send_single_media(chat_id, mt, fp, caption, thread_id)
+        else:
+            await mp.send_media_group(chat_id, processed, caption, thread_id)
+
+        mp.cleanup_specific([fp for _, fp in processed])
+        dm.delete_draft(draft_id)
+        await callback.message.answer("✅ Черновик опубликован!", reply_markup=after_post_keyboard())
+        await callback.answer()
+        return
+
+    if action == "toq":
+        draft = dm.get_draft(draft_id)
+        if not draft:
+            await callback.answer("❌ Черновик не найден")
+            return
+        qm = get_queue_manager()
+        qm.add_to_queue(
+            user_id=callback.from_user.id,
+            name=draft["name"],
+            category_key=draft["category_key"],
+            category_data=draft["category_data"],
+            platform_id=draft["platform_id"],
+            media_files=draft["media_files"],
+            selected_hashtags=draft.get("selected_hashtags", []),
+            description=draft.get("description", ""),
+            topic=draft.get("topic"),
+            is_comic=draft.get("is_comic", False),
+            comic_link=draft.get("comic_link", ""),
+            comic_title=draft.get("comic_title", ""),
+        )
+        dm.delete_draft(draft_id)
+        await callback.answer("📥 Добавлен в очередь")
+        await callback.message.answer("📥 Черновик добавлен в очередь.", reply_markup=main_menu())
+        return
+
+    await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  ОЧЕРЕДЬ
+# ──────────────────────────────────────────────────────────────────────────────
 
 @router.message(F.text == "📥 Очередь")
-async def show_queue(message: Message, state: FSMContext):
-    """Показать очередь"""
-    status = queue_mgr.get_status()
-    
+async def queue_menu(message: Message, state: FSMContext):
+    if not _is_authorized(message.from_user.id):
+        return
+    await state.clear()
+    qm = get_queue_manager()
+    status = qm.get_status()
     await message.answer(
-        queue_mgr.get_status_text(),
+        qm.get_status_text(),
         reply_markup=queue_menu_keyboard(
-            running=status['running'],
-            count=status['pending'],
-            interval=status['interval']
+            status["running"], status["pending"], status["interval"]
         ),
-        parse_mode='HTML'
+        parse_mode="HTML",
     )
+
 
 @router.callback_query(F.data.startswith("q:"))
 async def queue_callback(callback: CallbackQuery, state: FSMContext):
-    """Обработка действий с очередью"""
-    action = callback.data.split(":")[1]
-    
+    action = callback.data.split(":", 2)[1]
+    qm = get_queue_manager()
+
     if action == "back":
-        await callback.message.edit_text("👋 Главное меню")
-        await callback.message.answer("Выберите действие:", reply_markup=main_menu())
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("🏠 Главное меню", reply_markup=main_menu())
+        await callback.answer()
         return
-    
+
     if action == "menu":
-        status = queue_mgr.get_status()
+        status = qm.get_status()
         await callback.message.edit_text(
-            queue_mgr.get_status_text(),
+            qm.get_status_text(),
             reply_markup=queue_menu_keyboard(
-                running=status['running'],
-                count=status['pending'],
-                interval=status['interval']
+                status["running"], status["pending"], status["interval"]
             ),
-            parse_mode='HTML'
+            parse_mode="HTML",
         )
+        await callback.answer()
         return
-    
+
     if action == "start":
-        processor = MediaProcessor(callback.message.bot)
-        success = await queue_mgr.start_queue(processor, callback.message.bot)
-        
-        if success:
-            await callback.answer("✅ Очередь запущена")
-            status = queue_mgr.get_status()
-            await callback.message.edit_text(
-                queue_mgr.get_status_text(),
-                reply_markup=queue_menu_keyboard(
-                    running=status['running'],
-                    count=status['pending'],
-                    interval=status['interval']
-                ),
-                parse_mode='HTML'
+        mp = get_media_processor(callback.bot)
+        ok = await qm.start_queue(mp, callback.bot)
+        await callback.answer("▶️ Очередь запущена" if ok else "⚠️ Очередь уже запущена")
+        status = qm.get_status()
+        await callback.message.edit_reply_markup(
+            reply_markup=queue_menu_keyboard(
+                status["running"], status["pending"], status["interval"]
             )
-        else:
-            await callback.answer("❌ Нет постов для публикации", show_alert=True)
+        )
         return
-    
+
     if action == "stop":
-        await queue_mgr.stop_queue()
-        await callback.answer("⏹ Остановлено")
-        status = queue_mgr.get_status()
-        await callback.message.edit_text(
-            queue_mgr.get_status_text(),
+        await qm.stop_queue()
+        await callback.answer("⏹ Очередь остановлена")
+        status = qm.get_status()
+        await callback.message.edit_reply_markup(
             reply_markup=queue_menu_keyboard(
-                running=status['running'],
-                count=status['pending'],
-                interval=status['interval']
-            ),
-            parse_mode='HTML'
+                status["running"], status["pending"], status["interval"]
+            )
         )
         return
-    
+
     if action == "setint":
-        await callback.message.answer(
-            "⏱ <b>Настройка интервала</b>\n\n"
-            "Введите интервал в минутах (1-1440):",
-            parse_mode='HTML'
-        )
+        await callback.message.answer("⏱ Введите интервал в минутах (1–1440):")
         await state.set_state(QueueFlow.set_interval)
+        await callback.answer()
         return
-    
+
     if action == "list":
-        items = queue_mgr.get_queue()
+        items = qm.get_queue()
         if not items:
-            await callback.answer("Очередь пуста", show_alert=True)
+            await callback.answer("📭 Очередь пуста")
             return
-        
-        hint = "Нажмите на название — подробности\nНажмите 🗑️ — удалить"
-        if queue_mgr.running:
-            hint += "\n▶️ — публикуется сейчас, нельзя удалить"
-        
-        await callback.message.edit_text(
-            f"📋 <b>Очередь ({len(items)} эл.)</b>\n\n{hint}:",
-            reply_markup=queue_list_keyboard(items, running=queue_mgr.running, active_ids=set(queue_mgr._active.values())),
-            parse_mode='HTML'
+        await callback.message.answer(
+            f"📋 Очередь ({len(items)} постов):",
+            reply_markup=queue_list_keyboard(items),
         )
+        await callback.answer()
         return
-    
-    if action == "detail":
-        index = int(callback.data.split(":")[2])
-        items = queue_mgr.get_queue()
-        if index >= len(items):
-            await callback.answer("❌ Элемент не найден", show_alert=True)
-            return
-        
-        item = items[index]
-        cat_key = item.get('category_key', 'default')
-        active_id = queue_mgr._active.get(cat_key)
-        is_active = queue_mgr.running and active_id == item.get("id")
-        
-        # Форматируем детальную инфу
-        item_type = item.get("type", "single")
-        cat_data = item.get("category_data", {})
-        cat_name = f"{cat_data.get('emoji', '')} {cat_data.get('name', '—')}"
-        hashtags = item.get("selected_hashtags", [])
-        created = item.get("created_at", "")
-        
-        if item_type == "batch":
-            posts = item.get("posts", [])
-            schedule = item.get("schedule", [])
-            shuffle = item.get("shuffle", False)
-            time_period = item.get("time_period", "—")
-            time_value = item.get("time_value", "—")
-            
-            # Преобразуем период
-            period_map = {"minute": "мин", "hour": "ч", "day": "дн", "week": "нед"}
-            period_label = period_map.get(time_period, time_period)
-            
-            # Первый/последний пост
-            first_str = last_str = "—"
-            if schedule:
-                def parse_dt(s):
-                    return datetime.fromisoformat(s) if isinstance(s, str) else s
-                first_str = parse_dt(schedule[0]).strftime("%d.%m %H:%M")
-                if len(schedule) > 1:
-                    last_str = parse_dt(schedule[-1]).strftime("%d.%m %H:%M")
-                else:
-                    last_str = first_str
-            
-            # Считаем файлы в постах
-            files_per_post = len(posts[0]) if posts else 0
-            
-            status = "▶️ <b>Публикуется прямо сейчас</b>\n" if is_active else ""
-            progress = queue_mgr._active_progress if is_active else ""
-            
-            text = (
-                f"📦 <b>{item.get('name', 'Пакет')}</b>\n\n"
-                f"{status}"
-                + (f"📊 Прогресс: <i>{progress}</i>\n\n" if progress else "\n")
-                + f"📁 Категория: {cat_name}\n"
-                f"📊 Постов в пакете: <b>{len(posts)}</b>\n"
-                f"🖼 Файлов в посте: <b>{files_per_post}</b>\n"
-                f"🔀 Перемешан: <b>{'Да' if shuffle else 'Нет'}</b>\n"
-                f"⏰ Период: <b>{time_value} {period_label}</b>\n"
-                f"🕐 Первый пост: <b>{first_str}</b>\n"
-                f"🕐 Последний пост: <b>{last_str}</b>\n"
-                f"#️⃣ Хештегов: <b>{len(hashtags)}</b>\n"
-            )
-            if hashtags:
-                text += f"<i>{' '.join(hashtags[:6])}{'...' if len(hashtags) > 6 else ''}</i>\n"
-        else:
-            media_files = item.get("media_files", [])
-            text = (
-                f"📄 <b>{item.get('name', 'Пост')}</b>\n\n"
-                f"{'▶️ <b>Публикуется прямо сейчас</b>' if is_active else ''}"
-                f"\n📁 Категория: {cat_name}\n"
-                f"🖼 Файлов: <b>{len(media_files)}</b>\n"
-                f"#️⃣ Хештегов: <b>{len(hashtags)}</b>\n"
-            )
-            if hashtags:
-                text += f"<i>{' '.join(hashtags[:6])}{'...' if len(hashtags) > 6 else ''}</i>\n"
-        
-        await callback.message.edit_text(
-            text,
-            reply_markup=queue_item_detail_keyboard(index, is_active),
-            parse_mode='HTML'
-        )
-        return
-    
-    if action == "rm":
-        index = int(callback.data.split(":")[2])
-        removed = queue_mgr.remove_from_queue(index)
-        if not removed:
-            await callback.answer("⚠️ Нельзя удалить — сейчас публикуется!", show_alert=True)
-        else:
-            await callback.answer("🗑️ Удалено")
-        
-        items = queue_mgr.get_queue()
-        if items:
-            hint = "Нажмите на название — подробности\nНажмите 🗑️ — удалить"
-            if queue_mgr.running:
-                hint += "\n▶️ — публикуется сейчас, нельзя удалить"
-            await callback.message.edit_text(
-                f"📋 <b>Очередь ({len(items)} эл.)</b>\n\n{hint}:",
-                reply_markup=queue_list_keyboard(items, running=queue_mgr.running, active_ids=set(queue_mgr._active.values())),
-                parse_mode='HTML'
-            )
-        else:
-            await callback.message.edit_text("📋 Очередь пуста")
-            await callback.message.answer("Что дальше?", reply_markup=main_menu())
-        return
-    
+
     if action == "clear":
-        queue_mgr.clear_queue()
+        qm.clear_queue()
         await callback.answer("🗑️ Очередь очищена")
-        status = queue_mgr.get_status()
+        status = qm.get_status()
         await callback.message.edit_text(
-            queue_mgr.get_status_text(),
+            qm.get_status_text(),
             reply_markup=queue_menu_keyboard(
-                running=status['running'],
-                count=status['pending'],
-                interval=status['interval']
+                status["running"], status["pending"], status["interval"]
             ),
-            parse_mode='HTML'
+            parse_mode="HTML",
         )
         return
 
+    if action == "rm":
+        index = int(callback.data.split(":")[-1])
+        qm.remove_from_queue(index)
+        await callback.answer("🗑️ Пост удалён")
+        items = qm.get_queue()
+        if items:
+            await callback.message.edit_reply_markup(reply_markup=queue_list_keyboard(items))
+        else:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("📭 Очередь пуста.", reply_markup=main_menu())
+        return
 
-@router.callback_query(F.data == "q:noop")
-async def queue_noop(callback: CallbackQuery):
-    await callback.answer("▶️ Этот элемент сейчас публикуется — удаление невозможно", show_alert=True)
+    await callback.answer()
+
 
 @router.message(QueueFlow.set_interval)
-async def queue_interval_set(message: Message, state: FSMContext):
-    """Установка интервала очереди"""
+async def queue_set_interval(message: Message, state: FSMContext):
     try:
-        interval = int(message.text)
-        if 1 <= interval <= 1440:
-            queue_mgr.set_interval(interval)
-            await message.answer(
-                f"✅ Интервал установлен: {interval} минут",
-                reply_markup=main_menu()
-            )
-            await state.clear()
-        else:
-            await message.answer("❌ Введите число от 1 до 1440")
+        minutes = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ Введите корректное число")
+        await message.answer("⚠️ Введите число от 1 до 1440.")
+        return
 
-# ============ ОЧИСТКА ЧАТА ============
+    qm = get_queue_manager()
+    qm.set_interval(minutes)
+    await state.clear()
+    status = qm.get_status()
+    await message.answer(
+        f"✅ Интервал установлен: {qm.interval_minutes} мин",
+        reply_markup=queue_menu_keyboard(
+            status["running"], status["pending"], status["interval"]
+        ),
+    )
 
-@router.message(F.text == "🧹 Очистить чат")
-async def clear_chat(message: Message, bot: Bot):
-    """Очистка чата"""
-    try:
-        for i in range(1, 100):
-            try:
-                await bot.delete_message(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id - i
-                )
-            except:
-                pass
-        await message.answer("✅ Чат очищен", reply_markup=main_menu())
-    except Exception as e:
-        logger.error(f"Ошибка очистки: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  МОИ ХЕШТЕГИ
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.message(F.text == "#️⃣ Мои хештеги")
+async def my_hashtags(message: Message, state: FSMContext):
+    if not _is_authorized(message.from_user.id):
+        return
+    await state.clear()
+    await message.answer(
+        "#️⃣ <b>Мои хештеги</b>",
+        reply_markup=my_hashtags_menu_keyboard(message.from_user.id),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("myhash:"))
+async def myhash_callback(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":", 3)
+    action = parts[1]
+
+    if action == "back":
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.message.answer("🏠 Главное меню", reply_markup=main_menu())
+        await callback.answer()
+        return
+
+    if action == "menu":
+        await callback.message.edit_reply_markup(
+            reply_markup=my_hashtags_menu_keyboard(callback.from_user.id)
+        )
+        await callback.answer()
+        return
+
+    if action == "templates":
+        await callback.message.edit_reply_markup(
+            reply_markup=user_templates_list_keyboard(callback.from_user.id)
+        )
+        await callback.answer()
+        return
+
+    if action == "help":
+        text = (
+            "ℹ️ <b>Как использовать шаблоны хештегов</b>\n\n"
+            "1. При создании поста выберите хештеги\n"
+            "2. Нажмите «💾 Сохранить как шаблон»\n"
+            "3. В следующий раз выберите «📋 Мои шаблоны»\n\n"
+            "Шаблоны сохраняются отдельно для каждой категории."
+        )
+        await callback.message.answer(text, parse_mode="HTML")
+        await callback.answer()
+        return
+
+    if action == "cat":
+        cat_key = parts[2]
+        await callback.message.edit_reply_markup(
+            reply_markup=category_templates_keyboard(callback.from_user.id, cat_key)
+        )
+        await callback.answer()
+        return
+
+    if action == "view":
+        cat_key = parts[2]
+        template_name = parts[3]
+        config = load_config()
+        tags = (
+            config.get("hashtag_templates", {})
+            .get(str(callback.from_user.id), {})
+            .get(cat_key, {})
+            .get(template_name, [])
+        )
+        text = f"📋 <b>{template_name}</b>\n\n" + " ".join(tags)
+        await callback.message.answer(
+            text,
+            reply_markup=template_actions_keyboard(cat_key, template_name),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
+    if action == "delete":
+        cat_key = parts[2]
+        template_name = parts[3]
+        config = load_config()
+        user_str = str(callback.from_user.id)
+        config.get("hashtag_templates", {}).get(user_str, {}).get(cat_key, {}).pop(
+            template_name, None
+        )
+        with open("config.json", "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        await callback.answer(f"🗑️ Шаблон «{template_name}» удалён")
+        await callback.message.edit_reply_markup(
+            reply_markup=user_templates_list_keyboard(callback.from_user.id)
+        )
+        return
+
+    await callback.answer()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Заглушка для необработанных сообщений
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.message(StateFilter(None))
+async def unknown_message(message: Message):
+    if not _is_authorized(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этому боту.")
+        return
+    await message.answer("🏠 Главное меню", reply_markup=main_menu())
