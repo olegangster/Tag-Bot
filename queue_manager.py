@@ -1,523 +1,465 @@
+"""
+queue_manager.py — менеджер очереди публикаций
+
+КЛЮЧЕВЫЕ ФИЧИ:
+- Параллельная публикация по разным категориям (Альтушки и 3Д публикуются одновременно)
+- Последовательная публикация внутри одной категории
+- Вопрос о чередовании ТОЛЬКО при добавлении в ту же категорию
+"""
+import asyncio
 import json
 import logging
-import asyncio
+import random
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
-from datetime import datetime
-import uuid
 
 logger = logging.getLogger(__name__)
 
 
+def load_config() -> dict:
+    with open("config.json", "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 class QueueManager:
-    """
-    Менеджер очереди постов.
-
-    Функции:
-    - Добавление постов в очередь
-    - Просмотр очереди
-    - Запуск/остановка публикации
-    - Статус публикации (сколько опубликовано/осталось)
-    - Удаление из очереди
-    - Настройка интервала
-    """
-
     def __init__(self, filepath: str = "queue.json"):
         self.filepath = Path(filepath)
-        self.queue = self._load()
-        self.running = False
-        self.current_task = None
-        self.interval_minutes = 10
-        self.published_count = 0
-        self.batch_info: Dict = {}
+        self._items: List[Dict] = self._load()   # все элементы в порядке добавления
+        self._tasks: Dict[str, asyncio.Task] = {}  # category_key -> Task
+        self._active: Dict[str, str] = {}           # category_key -> id активного элемента
+        self._progress: Dict[str, str] = {}         # category_key -> строка прогресса
+        self.running: bool = False
+        self.interval: int = 60
 
-    # ──────────────────────────────────────────────────────
-    #  Персистентность
-    # ──────────────────────────────────────────────────────
+    # ─────────────────────── persistence ───────────────────────
 
-    def _load(self) -> List:
+    def _load(self) -> List[Dict]:
         if self.filepath.exists():
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                for item in data:
+                    if "schedule" in item:
+                        item["schedule"] = [
+                            datetime.fromisoformat(s) if isinstance(s, str) else s
+                            for s in item["schedule"]
+                        ]
+                return data
             except Exception as e:
                 logger.error(f"Ошибка загрузки очереди: {e}")
         return []
 
     def _save(self):
         try:
+            data = []
+            for item in self._items:
+                ic = dict(item)
+                if "schedule" in ic:
+                    ic["schedule"] = [
+                        s.isoformat() if isinstance(s, datetime) else s
+                        for s in ic["schedule"]
+                    ]
+                data.append(ic)
             with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump(self.queue, f, ensure_ascii=False, indent=2)
+                json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"Ошибка сохранения очереди: {e}")
 
-    # ──────────────────────────────────────────────────────
-    #  Добавление в очередь
-    # ──────────────────────────────────────────────────────
+    # ─────────────────────── category helpers ───────────────────────
 
-    def add_to_queue(
-        self,
-        user_id: int,
-        name: str,
-        category_key: str,
-        category_data: Dict,
-        platform_id: str,
-        media_files: List[tuple],
-        selected_hashtags: List[str],
-        description: str = "",
-        topic: str = None,
-        is_comic: bool = False,
-        comic_link: str = "",
-        comic_title: str = "",
-        scheduled_time: datetime = None,
-        batch_id: str = None,
-    ) -> str:
+    def _cat_key(self, item: Dict) -> str:
+        """Ключ категории для группировки параллельных задач"""
+        return item.get("category_key", "default")
+
+    def is_category_active(self, category_key: str) -> bool:
+        """Есть ли активная задача публикации для данной категории?"""
+        task = self._tasks.get(category_key)
+        return task is not None and not task.done()
+
+    def get_active_info_for_category(self, category_key: str) -> Optional[Dict]:
+        """Активный элемент для категории"""
+        active_id = self._active.get(category_key)
+        if not active_id:
+            return None
+        for item in self._items:
+            if item.get("id") == active_id:
+                return item
+        return None
+
+    def get_progress_for_category(self, category_key: str) -> str:
+        return self._progress.get(category_key, "")
+
+    # ─────────────────────── add items ───────────────────────
+
+    def add_to_queue(self, user_id, name, category_key, category_data, platform_id,
+                     media_files, selected_hashtags, description="", topic=None,
+                     is_comic=False, comic_link="", comic_title="") -> str:
         item_id = str(uuid.uuid4())[:8]
-        item = {
-            "id": item_id,
-            "user_id": user_id,
-            "name": name,
-            "category_key": category_key,
-            "category_data": category_data,
-            "category_name": category_data.get("name", ""),
-            "platform_id": platform_id,
-            "topic": topic,
-            "media_files": media_files,
-            "selected_hashtags": selected_hashtags,
-            "description": description,
-            "is_comic": is_comic,
-            "comic_link": comic_link,
-            "comic_title": comic_title,
-            "added_at": datetime.now().isoformat(),
-            "scheduled_time": scheduled_time.isoformat() if scheduled_time else None,
-            "batch_id": batch_id,
-            "status": "pending",
-        }
-        self.queue.append(item)
+        self._items.append({
+            "id": item_id, "type": "single", "user_id": user_id, "name": name,
+            "category_key": category_key, "category_data": category_data,
+            "platform_id": platform_id, "media_files": media_files,
+            "selected_hashtags": selected_hashtags, "description": description,
+            "topic": topic, "is_comic": is_comic, "comic_link": comic_link,
+            "comic_title": comic_title, "created_at": datetime.now().isoformat(),
+        })
         self._save()
-        logger.info(f"Добавлен в очередь: {item_id} ({name})")
         return item_id
 
-    def add_batch_to_queue(
-        self,
-        user_id: int,
-        category_data: Dict,
-        category_key: str,
-        platform_id: str,
-        posts: List[List[tuple]],
-        selected_hashtags: List[str],
-        schedule: List[datetime],
-        topic: str = None,
-        time_period: str = "minute",
-        time_value: int = 60,
-    ) -> str:
+    def add_batch_to_queue(self, user_id, category_data, category_key, platform_id,
+                           posts, selected_hashtags, schedule, topic, time_period,
+                           time_value, shuffle=False) -> str:
         batch_id = str(uuid.uuid4())[:8]
-        self.batch_info[batch_id] = {
-            "id": batch_id,
-            "total_posts": len(posts),
-            "published": 0,
-            "failed": 0,
-            "start_time": schedule[0].isoformat() if schedule else None,
-            "end_time": schedule[-1].isoformat() if len(schedule) > 1 else None,
-            "time_period": time_period,
-            "time_value": time_value,
-            "category_name": category_data.get("name", ""),
+        # shuffle уже применён до вызова этой функции если нужен
+        final_posts = list(posts)
+        if shuffle:
+            random.shuffle(final_posts)
+        self._items.append({
+            "id": batch_id, "type": "batch", "user_id": user_id,
+            "name": f"Пакет #{batch_id[:4]}", "category_key": category_key,
+            "category_data": category_data, "platform_id": platform_id,
+            "posts": final_posts, "selected_hashtags": selected_hashtags,
+            "schedule": schedule, "topic": topic, "time_period": time_period,
+            "time_value": time_value, "shuffle": shuffle,
             "created_at": datetime.now().isoformat(),
-        }
-        for i, (post_media, scheduled_time) in enumerate(zip(posts, schedule)):
-            self.add_to_queue(
-                user_id=user_id,
-                name=f"Пакет #{batch_id[:4]} - пост {i + 1}/{len(posts)}",
-                category_key=category_key,
-                category_data=category_data,
-                platform_id=platform_id,
-                media_files=post_media,
-                selected_hashtags=selected_hashtags,
-                topic=topic,
-                scheduled_time=scheduled_time,
-                batch_id=batch_id,
-            )
-        logger.info(f"Пакет {batch_id} добавлен в очередь: {len(posts)} постов")
+        })
+        self._save()
+        logger.info(f"Пакет #{batch_id[:4]} ({len(posts)} постов) добавлен [{category_key}]")
         return batch_id
 
-    # ──────────────────────────────────────────────────────
-    #  Геттеры
-    # ──────────────────────────────────────────────────────
+    def merge_batch_into_active(self, user_id, category_data, category_key, platform_id,
+                                posts, selected_hashtags, topic, time_period, time_value,
+                                shuffle=False) -> Optional[str]:
+        """Совмещает новый пакет с активным ТОЙ ЖЕ категории — посты чередуются"""
+        active = self.get_active_info_for_category(category_key)
+        if not active or active.get("type") != "batch":
+            return None
+        active_schedule = active.get("schedule", [])
+        if not active_schedule:
+            return None
+
+        new_posts = list(posts)
+        if shuffle:
+            random.shuffle(new_posts)
+
+        now = datetime.now()
+        if len(active_schedule) >= 2:
+            s0 = active_schedule[0] if isinstance(active_schedule[0], datetime) else datetime.fromisoformat(active_schedule[0])
+            s1 = active_schedule[1] if isinstance(active_schedule[1], datetime) else datetime.fromisoformat(active_schedule[1])
+            interval_sec = max((s1 - s0).total_seconds(), 60)
+        else:
+            interval_sec = 3600
+
+        next_t = None
+        for s in active_schedule:
+            t = s if isinstance(s, datetime) else datetime.fromisoformat(s)
+            if t > now:
+                next_t = t
+                break
+        if next_t is None:
+            next_t = now + timedelta(seconds=interval_sec)
+
+        half = interval_sec / 2
+        new_schedule = [next_t + timedelta(seconds=half + i * interval_sec) for i in range(len(new_posts))]
+
+        return self.add_batch_to_queue(
+            user_id=user_id, category_data=category_data, category_key=category_key,
+            platform_id=platform_id, posts=new_posts, selected_hashtags=selected_hashtags,
+            schedule=new_schedule, topic=topic, time_period=time_period,
+            time_value=time_value, shuffle=False,
+        )
+
+    # ─────────────────────── queue control ───────────────────────
 
     def get_queue(self) -> List[Dict]:
-        return self.queue
+        return list(self._items)
 
-    def get_pending_count(self) -> int:
-        return sum(1 for item in self.queue if item.get("status") == "pending")
+    def remove_from_queue(self, index: int) -> bool:
+        """Удаляет элемент по индексу. Нельзя удалить активно публикуемый."""
+        if index < 0 or index >= len(self._items):
+            return False
+        item = self._items[index]
+        cat_key = self._cat_key(item)
+        if self._active.get(cat_key) == item.get("id"):
+            return False  # сейчас публикуется
+        self._items.pop(index)
+        self._save()
+        logger.info(f"Удалён из очереди: {item.get('name')}")
+        return True
 
-    def get_published_count(self) -> int:
-        return sum(1 for item in self.queue if item.get("status") == "published")
+    def clear_queue(self, skip_active: bool = True):
+        if skip_active:
+            active_ids = set(self._active.values())
+            self._items = [i for i in self._items if i.get("id") in active_ids]
+        else:
+            self._items.clear()
+        self._save()
+
+    def set_interval(self, minutes: int):
+        self.interval = max(1, int(minutes))
+
+    # ─────────────────────── status ───────────────────────
+
+    @property
+    def _active_progress(self) -> str:
+        """Для обратной совместимости"""
+        return " | ".join(v for v in self._progress.values() if v)
 
     def get_status(self) -> Dict:
         return {
-            "total": len(self.queue),
-            "pending": self.get_pending_count(),
-            "published": self.get_published_count(),
             "running": self.running,
-            "interval": self.interval_minutes,
+            "pending": len(self._items),
+            "interval": self.interval,
+            "active_progress": self._active_progress,
         }
 
     def get_status_text(self) -> str:
-        status = self.get_status()
+        s = self.get_status()
+        icon = "🟢 Активна" if s["running"] else "🔴 Остановлена"
+        text = f"📥 <b>Очередь публикаций</b>\n\nСтатус: <b>{icon}</b>\n"
 
-        batch_posts: Dict = {}
-        for item in self.queue:
-            if item.get("batch_id"):
-                bid = item["batch_id"]
-                if bid not in batch_posts:
-                    batch_posts[bid] = {
-                        "total": 0,
-                        "published": 0,
-                        "pending": 0,
-                        "failed": 0,
-                        "category": item.get("category_name", ""),
-                        "scheduled_times": [],
-                    }
-                batch_posts[bid]["total"] += 1
-                s = item.get("status")
-                if s == "published":
-                    batch_posts[bid]["published"] += 1
-                elif s == "pending":
-                    batch_posts[bid]["pending"] += 1
-                    if item.get("scheduled_time"):
-                        batch_posts[bid]["scheduled_times"].append(
-                            datetime.fromisoformat(item["scheduled_time"])
-                        )
-                elif s == "failed":
-                    batch_posts[bid]["failed"] += 1
+        if s["running"]:
+            for cat_key, progress in self._progress.items():
+                if progress:
+                    text += f"▶️ <i>{progress}</i>\n"
 
-        text = "📥 <b>Статус очереди</b>\n\n"
-        text += f"📊 Всего в очереди: {status['total']}\n"
-        text += f"⏳ Ожидают: {status['pending']}\n"
-        text += f"✅ Опубликовано: {status['published']}\n\n"
+        text += f"📋 Элементов в очереди: <b>{s['pending']}</b>\n"
+        text += f"⏱ Интервал: <b>{s['interval']} мин</b>\n"
 
-        if batch_posts:
-            text += "📦 <b>Пакетные отправки:</b>\n\n"
-            for bid, info in batch_posts.items():
-                text += f"🔹 Пакет #{bid[:4]}\n"
-                text += f"   Категория: {info['category']}\n"
-                text += f"   Всего: {info['total']} | Опубл: {info['published']} | Ожидают: {info['pending']}\n"
-                if info["scheduled_times"]:
-                    next_t = min(info["scheduled_times"])
-                    last_t = max(info["scheduled_times"])
-                    text += f"   ⏰ След. пост: {next_t.strftime('%d.%m %H:%M')}\n"
-                    if info["pending"] > 1:
-                        text += f"   🕐 Последний: {last_t.strftime('%d.%m %H:%M')}\n"
-                if info["failed"] > 0:
-                    text += f"   ❌ Ошибок: {info['failed']}\n"
-                text += "\n"
+        active_count = sum(1 for t in self._tasks.values() if not t.done())
+        if active_count > 1:
+            text += f"🔀 Параллельных категорий: <b>{active_count}</b>\n"
 
-        text += f"⏱ Интервал: {status['interval']} минут\n"
-        text += f"▶️ Статус: {'Работает' if status['running'] else 'Остановлена'}"
         return text
 
-    def get_batch_status(self, batch_id: str) -> Optional[Dict]:
-        batch_posts = [item for item in self.queue if item.get("batch_id") == batch_id]
-        if not batch_posts:
-            return None
-        total = len(batch_posts)
-        published = sum(1 for p in batch_posts if p.get("status") == "published")
-        pending = sum(1 for p in batch_posts if p.get("status") == "pending")
-        failed = sum(1 for p in batch_posts if p.get("status") == "failed")
-        scheduled_times = [
-            datetime.fromisoformat(p["scheduled_time"])
-            for p in batch_posts
-            if p.get("scheduled_time") and p.get("status") == "pending"
-        ]
-        return {
-            "id": batch_id,
-            "total": total,
-            "published": published,
-            "pending": pending,
-            "failed": failed,
-            "next_post_time": min(scheduled_times) if scheduled_times else None,
-            "last_post_time": max(scheduled_times) if scheduled_times else None,
-            "category_name": batch_posts[0].get("category_name", ""),
-        }
-
-    # ──────────────────────────────────────────────────────
-    #  Управление очередью
-    # ──────────────────────────────────────────────────────
-
-    def remove_from_queue(self, index: int) -> bool:
-        try:
-            if 0 <= index < len(self.queue):
-                removed = self.queue.pop(index)
-                self._save()
-                logger.info(f"Удален из очереди: {removed.get('name')}")
-                return True
-        except Exception as e:
-            logger.error(f"Ошибка удаления из очереди: {e}")
+    def is_batch_active(self) -> bool:
+        """Обратная совместимость"""
+        for cat_key, active_id in self._active.items():
+            for item in self._items:
+                if item.get("id") == active_id and item.get("type") == "batch":
+                    return True
         return False
 
-    def clear_queue(self):
-        self.queue = []
-        self._save()
-        self.published_count = 0
-        logger.info("Очередь очищена")
+    def get_active_info(self) -> Optional[Dict]:
+        """Обратная совместимость — первый попавшийся активный"""
+        for cat_key, active_id in self._active.items():
+            for item in self._items:
+                if item.get("id") == active_id:
+                    return item
+        return None
 
-    def set_interval(self, minutes: int):
-        self.interval_minutes = max(1, min(minutes, 1440))
-        logger.info(f"Установлен интервал: {self.interval_minutes} минут")
-
-    # ──────────────────────────────────────────────────────
-    #  Запуск / остановка
-    # ──────────────────────────────────────────────────────
+    # ─────────────────────── start / stop ───────────────────────
 
     async def start_queue(self, media_processor, bot) -> bool:
-        if self.running:
-            logger.warning("Очередь уже запущена")
+        """Запускает задачи для всех категорий в очереди параллельно"""
+        if not self._items:
             return False
-        if not self.get_pending_count():
-            logger.warning("Нет постов для публикации")
-            return False
+
         self.running = True
-        self.published_count = 0
-        logger.info(
-            f"Запуск очереди: {self.get_pending_count()} постов "
-            f"с интервалом {self.interval_minutes} мин"
-        )
-        self.current_task = asyncio.create_task(
-            self._process_queue(media_processor, bot)
-        )
+        categories = set(self._cat_key(item) for item in self._items)
+        for cat_key in categories:
+            if not self.is_category_active(cat_key):
+                self._tasks[cat_key] = asyncio.create_task(
+                    self._process_category_loop(cat_key, media_processor, bot)
+                )
+                logger.info(f"▶️ Запущена задача для [{cat_key}]")
+
         return True
 
-    async def stop_queue(self) -> bool:
-        if not self.running:
-            return False
+    async def ensure_category_running(self, cat_key: str, media_processor, bot):
+        """
+        Запускает задачу для конкретной категории если она ещё не запущена.
+        Вызывается после добавления нового элемента в очередь.
+        """
+        if not self.is_category_active(cat_key):
+            self.running = True
+            self._tasks[cat_key] = asyncio.create_task(
+                self._process_category_loop(cat_key, media_processor, bot)
+            )
+            logger.info(f"▶️ Автозапуск [{cat_key}]")
+
+    async def stop_queue(self):
         self.running = False
-        if self.current_task:
-            self.current_task.cancel()
-            try:
-                await self.current_task
-            except asyncio.CancelledError:
-                pass
-        logger.info("Очередь остановлена")
-        return True
-
-    # ──────────────────────────────────────────────────────
-    #  Внутренняя обработка
-    # ──────────────────────────────────────────────────────
-
-    async def _process_queue(self, media_processor, bot):
-        try:
-            config_path = Path("config.json")
-            if not config_path.exists():
-                logger.error("config.json не найден")
-                return
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = json.load(f)
-
-            # Scheduled посты запускаем параллельно
-            scheduled_tasks = []
-            for item in self.queue:
-                if not self.running:
-                    break
-                if item.get("status") != "pending":
-                    continue
-                if item.get("scheduled_time"):
-                    task = asyncio.create_task(
-                        self._publish_scheduled_post(item, media_processor, bot, config)
-                    )
-                    scheduled_tasks.append(task)
-
-            if scheduled_tasks:
-                logger.info(f"Запущено {len(scheduled_tasks)} scheduled постов")
-                await asyncio.gather(*scheduled_tasks, return_exceptions=True)
-
-            # Обычные посты (без расписания) — последовательно с интервалом
-            for item in self.queue:
-                if not self.running:
-                    break
-                if item.get("status") != "pending":
-                    continue
-                if item.get("scheduled_time"):
-                    continue
-
-                item["status"] = "publishing"
-                self._save()
+        for cat_key, task in list(self._tasks.items()):
+            if not task.done():
+                task.cancel()
                 try:
-                    await self._publish_post(item, media_processor, bot, config)
-                    item["status"] = "published"
-                    item["published_at"] = datetime.now().isoformat()
-                    self.published_count += 1
-                    self._save()
-                    logger.info(
-                        f"✅ Опубликован из очереди: {item['name']} ({self.published_count})"
-                    )
-                    if self.running:
-                        await asyncio.sleep(self.interval_minutes * 60)
-                except Exception as e:
-                    item["status"] = "failed"
-                    item["error"] = str(e)
-                    self._save()
-                    logger.error(f"Ошибка публикации из очереди: {e}")
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._tasks.clear()
+        self._active.clear()
+        self._progress.clear()
+        logger.info("⏹ Очередь остановлена")
 
-        except asyncio.CancelledError:
-            logger.info("Обработка очереди отменена")
-        except Exception as e:
-            logger.error(f"Критическая ошибка в _process_queue: {e}")
-        finally:
+    # ─────────────────────── processing loops ───────────────────────
+
+    async def _process_category_loop(self, cat_key: str, media_processor, bot):
+        """
+        Обрабатывает очередь ОДНОЙ категории независимо от других категорий.
+        Альтушки и 3Д работают параллельно и не ждут друг друга.
+        """
+        logger.info(f"▶️ Цикл [{cat_key}] запущен")
+        first_item = True
+
+        while self.running:
+            item = self._get_next_pending(cat_key)
+            if item is None:
+                break
+
+            self._active[cat_key] = item["id"]
+
+            try:
+                # Интервал между элементами внутри одной категории
+                if not first_item:
+                    logger.info(f"⏳ [{cat_key}] ждём {self.interval} мин до следующего элемента")
+                    await asyncio.sleep(self.interval * 60)
+
+                if item["type"] == "batch":
+                    await self._publish_batch(item, media_processor, bot, cat_key)
+                else:
+                    await self._publish_single(item, media_processor, bot, cat_key)
+
+                # Удаляем опубликованный элемент
+                self._items = [i for i in self._items if i.get("id") != item["id"]]
+                self._save()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Ошибка публикации [{cat_key}]: {e}")
+                self._items = [i for i in self._items if i.get("id") != item["id"]]
+                self._save()
+
+            first_item = False
+            self._active.pop(cat_key, None)
+            self._progress.pop(cat_key, None)
+
+        self._active.pop(cat_key, None)
+        self._progress.pop(cat_key, None)
+        self._tasks.pop(cat_key, None)
+
+        if not any(not t.done() for t in self._tasks.values()):
             self.running = False
 
-    async def _publish_scheduled_post(self, item, media_processor, bot, config):
-        try:
-            scheduled_time = datetime.fromisoformat(item["scheduled_time"])
-            wait_seconds = (scheduled_time - datetime.now()).total_seconds()
-            if wait_seconds > 0:
-                logger.info(
-                    f"Пост {item['name']} ожидает {wait_seconds:.0f}с "
-                    f"до {scheduled_time.strftime('%H:%M:%S')}"
-                )
-                await asyncio.sleep(wait_seconds)
+        logger.info(f"✅ Цикл [{cat_key}] завершён")
 
-            if not self.running:
-                return
+    def _get_next_pending(self, cat_key: str) -> Optional[Dict]:
+        """Следующий элемент для категории (не активный)"""
+        active_id = self._active.get(cat_key)
+        for item in self._items:
+            if self._cat_key(item) == cat_key and item.get("id") != active_id:
+                return item
+        return None
 
-            item["status"] = "publishing"
-            self._save()
-
-            await self._publish_post(item, media_processor, bot, config)
-
-            item["status"] = "published"
-            item["published_at"] = datetime.now().isoformat()
-            if item.get("batch_id") and item["batch_id"] in self.batch_info:
-                self.batch_info[item["batch_id"]]["published"] += 1
-            self.published_count += 1
-            self._save()
-            logger.info(
-                f"✅ Scheduled пост опубликован: {item['name']} "
-                f"в {datetime.now().strftime('%H:%M:%S')}"
-            )
-        except asyncio.CancelledError:
-            logger.warning(f"Публикация поста {item['name']} отменена")
-        except Exception as e:
-            item["status"] = "failed"
-            item["error"] = str(e)
-            if item.get("batch_id") and item["batch_id"] in self.batch_info:
-                self.batch_info[item["batch_id"]]["failed"] += 1
-            self._save()
-            logger.error(f"Ошибка публикации scheduled поста: {e}")
-
-    async def _publish_post(self, item, media_processor, bot, config):
+    async def _publish_single(self, item: Dict, media_processor, bot, cat_key: str):
+        self._progress[cat_key] = item.get("name", "Пост")
+        category_data = item["category_data"]
         platform_id = item["platform_id"]
-        chat_id = config["platforms"][platform_id]["chat_id"]
-        thread_id = None
+        topic = item.get("topic")
 
-        if item.get("topic"):
-            thread_id = (
-                config["platforms"][platform_id]["topics"]
-                .get(item["topic"], {})
-                .get("thread_id")
+        config = load_config()
+        platform_cfg = config.get("platforms", {}).get(platform_id, {})
+        chat_id = int(platform_cfg.get("chat_id", 0))
+        thread_id = self._resolve_thread(platform_cfg, topic)
+
+        if item.get("is_comic"):
+            invite_link = platform_cfg.get("invite_link", "https://t.me/your_channel")
+            caption = (
+                f"{category_data['emoji']} {category_data['name'].upper()} {category_data['emoji']}\n\n"
+                f"{category_data.get('emoji_row', '')}\n\n"
+                f'📖 <b><u><a href="{item.get("comic_link","")}">{ item.get("comic_title","")}</a></u></b>\n\n'
+                f"{category_data.get('emoji_row', '')}\n\n"
+                f"↘️⬇️↙️\n"
+                f'<a href="{invite_link}">Ссылка для друга</a>'
             )
-
-        # Комикс — только текстовое сообщение со ссылкой
-        if item.get("is_comic", False):
-            caption = self._format_comic_caption(item, config)
-            kwargs = {
-                "chat_id": chat_id,
-                "text": caption,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            }
+            kwargs = dict(chat_id=chat_id, text=caption, parse_mode="HTML")
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
             await bot.send_message(**kwargs)
-            return
-
-        # Обычный медиапост
-        processed_media = await media_processor.process_batch(item["media_files"])
-        if not processed_media:
-            raise Exception("Не удалось обработать медиа")
-
-        caption = self._format_caption(item, config)
-
-        if len(processed_media) == 1:
-            media_type, file_path = processed_media[0]
-            await media_processor.send_single_media(
-                chat_id=chat_id,
-                media_type=media_type,
-                file_path=file_path,
-                caption=caption,
-                thread_id=thread_id,
-            )
         else:
-            await media_processor.send_media_group(
-                chat_id=chat_id,
-                media_paths=processed_media,
-                caption=caption,
-                thread_id=thread_id,
-            )
+            media_files = item.get("media_files", [])
+            media_to_process = [(mtype, fid) for mtype, fid, *_ in media_files]
+            processed = await media_processor.process_batch(media_to_process)
+            if not processed:
+                return
+            caption = self._format_caption(category_data, item.get("selected_hashtags", []), platform_id)
+            if len(processed) == 1:
+                await media_processor.send_single_media(chat_id, processed[0][0], processed[0][1], caption, thread_id)
+            else:
+                await media_processor.send_media_group(chat_id, processed, caption, thread_id)
+            media_processor.cleanup_specific([p for _, p in processed])
+        logger.info(f"✅ '{item.get('name')}' опубликован [{cat_key}]")
 
-        paths = [path for _, path in processed_media]
-        media_processor.cleanup_specific(paths)
-
-    # ──────────────────────────────────────────────────────
-    #  Форматирование подписей
-    # ──────────────────────────────────────────────────────
-
-    def _format_caption(self, item: Dict, config: Dict) -> str:
+    async def _publish_batch(self, item: Dict, media_processor, bot, cat_key: str):
+        posts = item.get("posts", [])
+        schedule = item.get("schedule", [])
         category_data = item["category_data"]
-        selected_hashtags = item["selected_hashtags"]
         platform_id = item["platform_id"]
+        topic = item.get("topic")
+        batch_name = item.get("name", "Пакет")
+        total = len(posts)
 
+        config = load_config()
+        platform_cfg = config.get("platforms", {}).get(platform_id, {})
+        chat_id = int(platform_cfg.get("chat_id", 0))
+        thread_id = self._resolve_thread(platform_cfg, topic)
+        caption = self._format_caption(category_data, item.get("selected_hashtags", []), platform_id)
+
+        for i, (post_media_ids, sched_time) in enumerate(zip(posts, schedule)):
+            if not self.running:
+                break
+            self._progress[cat_key] = f"{batch_name}: {i+1}/{total}"
+
+            if isinstance(sched_time, str):
+                sched_time = datetime.fromisoformat(sched_time)
+            wait_sec = (sched_time - datetime.now()).total_seconds()
+            if wait_sec > 0:
+                logger.info(f"⏳ [{cat_key}] {batch_name} пост {i+1}/{total} через {wait_sec:.0f}с")
+                while wait_sec > 0 and self.running:
+                    await asyncio.sleep(min(wait_sec, 5.0))
+                    wait_sec = (sched_time - datetime.now()).total_seconds()
+
+            if not self.running:
+                break
+
+            try:
+                if post_media_ids and isinstance(post_media_ids[0], (list, tuple)):
+                    media_to_process = [(mtype, fid) for mtype, fid, *_ in post_media_ids]
+                else:
+                    media_to_process = list(post_media_ids)
+
+                processed = await media_processor.process_batch(media_to_process)
+                if not processed:
+                    continue
+                if len(processed) == 1:
+                    await media_processor.send_single_media(chat_id, processed[0][0], processed[0][1], caption, thread_id)
+                else:
+                    await media_processor.send_media_group(chat_id, processed, caption, thread_id)
+                media_processor.cleanup_specific([p for _, p in processed])
+                logger.info(f"✅ [{cat_key}] {batch_name}: {i+1}/{total}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Ошибка поста {i+1} [{cat_key}]: {e}")
+
+    def _resolve_thread(self, platform_cfg: Dict, topic: Optional[str]) -> Optional[int]:
+        if not topic:
+            return None
+        tid = platform_cfg.get("topics", {}).get(topic, {}).get("thread_id")
+        return int(tid) if tid else None
+
+    def _format_caption(self, category_data: Dict, hashtags: List[str], platform_id: str) -> str:
+        config = load_config()
         emoji_row = category_data.get("emoji_row", "")
-        category_title = (
-            f"{category_data['emoji']} {category_data['name'].upper()} {category_data['emoji']}"
-        )
-
-        hashtag_lines = [
-            " ".join(selected_hashtags[i : i + 3])
-            for i in range(0, len(selected_hashtags), 3)
-        ]
-        hashtags_formatted = "\n".join(hashtag_lines)
-
-        invite_link = config["platforms"][platform_id].get(
-            "invite_link", "https://t.me/your_channel"
-        )
-
-        caption = f"{category_title}\n\n"
-        caption += f"{emoji_row}\n"
-        caption += f"{hashtags_formatted}\n"
-        caption += f"{emoji_row}\n\n"
-        if item.get("description"):
-            caption += f"{item['description']}\n\n"
-        caption += "↘️⬇️↙️\n"
-        caption += f'<a href="{invite_link}">Ссылка для друга</a>'
-        return caption
-
-    def _format_comic_caption(self, item: Dict, config: Dict) -> str:
-        category_data = item["category_data"]
-        selected_hashtags = item.get("selected_hashtags", [])
-        platform_id = item["platform_id"]
-        comic_title = item.get("comic_title", "")
-        comic_link = item.get("comic_link", "")
-
-        emoji = category_data["emoji"]
-        name = category_data["name"].upper()
-        emoji_row = category_data.get("emoji_row", "")
-
-        invite_link = config["platforms"][platform_id].get(
-            "invite_link", "https://t.me/your_channel"
-        )
-
-        caption = f"{emoji} {name} {emoji}\n\n"
-        caption += f"{emoji_row}\n\n"
-        caption += f'📖 <b><u><a href="{comic_link}">{comic_title}</a></u></b>\n\n'
-
-        if selected_hashtags:
-            hashtag_lines = [
-                " ".join(selected_hashtags[i : i + 3])
-                for i in range(0, len(selected_hashtags), 3)
-            ]
-            caption += "\n".join(hashtag_lines) + "\n\n"
-
-        caption += f"{emoji_row}\n\n"
-        caption += "↘️⬇️↙️\n"
+        title = f"{category_data['emoji']} {category_data['name'].upper()} {category_data['emoji']}"
+        rows = [" ".join(hashtags[i:i+4]) for i in range(0, len(hashtags), 4)]
+        invite_link = config.get("platforms", {}).get(platform_id, {}).get("invite_link", "https://t.me/your_channel")
+        caption = f"{title}\n\n{emoji_row}\n"
+        if rows:
+            caption += "\n".join(rows) + "\n"
+        caption += f"{emoji_row}\n\n↘️⬇️↙️\n"
         caption += f'<a href="{invite_link}">Ссылка для друга</a>'
         return caption
