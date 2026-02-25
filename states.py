@@ -13,6 +13,9 @@ class PostFlow(StatesGroup):
     comic_title        = State()   # ввод названия комикса
     comic_hashtags     = State()   # выбор хештегов для комикса (опционально)
     
+    # Описание поста (опционально)
+    adding_description = State()             # ввод описания поста
+    
     # Новые состояния для создания графика
     custom_schedule_selecting_dates = State()    # выбор дат
     custom_schedule_posts_per_day   = State()    # ввод постов в день
