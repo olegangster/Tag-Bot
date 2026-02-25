@@ -240,7 +240,6 @@ class BatchPostingService:
         caption += f"{hashtags_formatted}\n"
         caption += f"{emoji_row}\n\n"
         
-        # Для канала добавляем строку с реферальным ботом
         if platform_type == 'channel':
             caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
         
