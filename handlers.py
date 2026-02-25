@@ -120,7 +120,6 @@ def format_post_caption(category_data: Dict, selected_hashtags: List[str], platf
     if description:
         caption += f"{description}\n\n"
     
-    # Для канала добавляем строку с реферальным ботом
     if platform_type == 'channel':
         caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
     
@@ -159,7 +158,6 @@ def format_comic_post(category_data: Dict, comic_title: str, comic_link: str,
     
     caption += f"{emoji_row}\n\n"
     
-    # Для канала добавляем строку с реферальным ботом
     if platform_type == 'channel':
         caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
     
@@ -822,7 +820,25 @@ async def hashtag_selection(callback: CallbackQuery, state: FSMContext):
         
         # Обычная публикация (не batch)
         await state.update_data(selected_hashtags=selected)
-        await publish_post(callback.message, state, callback.from_user.id)
+        
+        # Проверяем включена ли функция описания
+        config = load_config()
+        description_enabled = config.get('features', {}).get('post_description', False)
+        
+        if description_enabled:
+            # Предлагаем добавить описание
+            await callback.message.edit_text(
+                f"✅ Выбрано хештегов: <b>{len(selected)}</b>\n\n"
+                "📝 <b>Добавить описание к посту?</b>\n\n"
+                "Введите текст или нажмите <b>Пропустить</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⏭ Пропустить", callback_data="desc:skip")],
+                ]),
+                parse_mode='HTML'
+            )
+            await state.set_state(PostFlow.adding_description)
+        else:
+            await publish_post(callback.message, state, callback.from_user.id)
         return
 
     
@@ -1061,6 +1077,29 @@ async def save_hashtag_template(message: Message, state: FSMContext):
     )
 
 
+# ============ ОПИСАНИЕ ПОСТА ============
+
+@router.callback_query(F.data == "desc:skip")
+async def description_skip(callback: CallbackQuery, state: FSMContext):
+    """Пропуск описания"""
+    await publish_post(callback.message, state, callback.from_user.id)
+
+@router.message(PostFlow.adding_description)
+async def description_received(message: Message, state: FSMContext):
+    """Получено описание поста"""
+    if message.text == "❌ Отмена":
+        await cmd_start(message, state)
+        return
+    
+    description = message.text.strip()
+    await state.update_data(description=description)
+    
+    # Отправляем статусное сообщение и публикуем
+    status = await message.answer("⏳ Публикация...")
+    await state.update_data(status_message_id=status.message_id)
+    await publish_post(status, state, message.from_user.id)
+
+
 # ============ ПУБЛИКАЦИЯ ПОСТА ============
 
 async def publish_post(message: Message, state: FSMContext, user_id: int):
@@ -1190,6 +1229,7 @@ async def batch_upload_start(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("files_per_post:"))
 async def batch_files_per_post_selected(callback: CallbackQuery, state: FSMContext):
     """Выбрано количество файлов в посте"""
+    await callback.answer()
     files_per_post = int(callback.data.split(":")[1])
     
     data = await state.get_data()
@@ -1212,6 +1252,7 @@ async def batch_files_per_post_selected(callback: CallbackQuery, state: FSMConte
 @router.callback_query(F.data.startswith("time:category:"))
 async def batch_time_category(callback: CallbackQuery, state: FSMContext):
     """Выбрана единица времени"""
+    await callback.answer()
     time_cat = callback.data.split(":")[-1]
     
     await state.update_data(
@@ -1227,6 +1268,7 @@ async def batch_time_category(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "time:back")
 async def batch_time_back(callback: CallbackQuery, state: FSMContext):
     """Назад к выбору единицы времени"""
+    await callback.answer()
     await state.update_data(batch_step='time_category')
     
     await callback.message.edit_text(
@@ -1240,6 +1282,7 @@ async def batch_time_back(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("sched_type:"))
 async def schedule_type_selected(callback: CallbackQuery, state: FSMContext):
     """Выбран тип расписания: обычное или график"""
+    await callback.answer()
     sched_type = callback.data.split(":")[1]
     
     await state.update_data(schedule_type=sched_type)
@@ -1253,8 +1296,8 @@ async def schedule_type_selected(callback: CallbackQuery, state: FSMContext):
         )
     elif sched_type == "custom":
         # Создание графика - выбор дат
-        await state.set_state(PostFlow.custom_schedule_selecting_dates)
         await state.update_data(selected_dates=[])
+        await state.set_state(PostFlow.custom_schedule_selecting_dates)
         await callback.message.edit_text(
             "📅 <b>Создание графика публикаций</b>\n\n"
             "🗓 <b>Шаг 1/3:</b> Выберите дни для публикации постов\n\n"
@@ -1282,6 +1325,7 @@ async def custom_schedule_date_action(callback: CallbackQuery, state: FSMContext
             selected_dates.append(date_str)
         
         await state.update_data(selected_dates=selected_dates)
+        await callback.answer()
         
         await callback.message.edit_reply_markup(
             reply_markup=date_selection_keyboard(selected_dates)
@@ -1295,10 +1339,10 @@ async def custom_schedule_date_action(callback: CallbackQuery, state: FSMContext
         selected_dates = [(now + timedelta(days=i)).strftime("%d.%m") for i in range(14)]
         
         await state.update_data(selected_dates=selected_dates)
+        await callback.answer(f"✅ Выбрано {len(selected_dates)} дней")
         await callback.message.edit_reply_markup(
             reply_markup=date_selection_keyboard(selected_dates)
         )
-        await callback.answer(f"✅ Выбрано {len(selected_dates)} дней")
         return
     
     elif action == "clear":
@@ -1312,16 +1356,19 @@ async def custom_schedule_date_action(callback: CallbackQuery, state: FSMContext
         return
     
     elif action == "done":
-        # Готово - переход к выбору постов в день
+        # Re-read state to ensure fresh data
+        fresh_data = await state.get_data()
+        selected_dates = fresh_data.get('selected_dates', [])
+        
         if not selected_dates:
             await callback.answer("❌ Выберите хотя бы один день!", show_alert=True)
             return
         
+        await callback.answer(f"✅ Выбрано {len(selected_dates)} дней")
         await state.set_state(PostFlow.custom_schedule_posts_per_day)
         
-        data = await state.get_data()
-        media_files = data.get('media_files', [])
-        files_per_post = data.get('files_per_post', 1)
+        media_files = fresh_data.get('media_files', [])
+        files_per_post = fresh_data.get('files_per_post', 1)
         total_posts = len(media_files) // files_per_post + (1 if len(media_files) % files_per_post else 0)
         
         await callback.message.edit_text(
@@ -1336,11 +1383,12 @@ async def custom_schedule_date_action(callback: CallbackQuery, state: FSMContext
     
     elif action == "back":
         # Назад к выбору типа расписания
+        await callback.answer()
         await state.update_data(batch_step='schedule_type')
         
-        data = await state.get_data()
-        media_files = data.get('media_files', [])
-        files_per_post = data.get('files_per_post', 1)
+        fresh_data = await state.get_data()
+        media_files = fresh_data.get('media_files', [])
+        files_per_post = fresh_data.get('files_per_post', 1)
         posts_count = len(media_files) // files_per_post + (1 if len(media_files) % files_per_post else 0)
         
         await callback.message.edit_text(
@@ -1358,6 +1406,7 @@ async def custom_schedule_date_action(callback: CallbackQuery, state: FSMContext
 @router.callback_query(F.data.startswith("postsperday:"))
 async def custom_schedule_posts_per_day_selected(callback: CallbackQuery, state: FSMContext):
     """Выбрано количество постов в день"""
+    await callback.answer()
     action = callback.data.split(":")[1]
     
     if action == "back":
@@ -1402,6 +1451,7 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
     action = parts[1]
     data = await state.get_data()
     posts_per_day = data.get('posts_per_day', 1)
+    await callback.answer()
     
     if action == "preset":
         # Выбран готовый вариант
@@ -1657,6 +1707,7 @@ def generate_custom_schedule(selected_dates: List[str], selected_times: List[str
 @router.callback_query(F.data.startswith("schedule:"))
 async def batch_schedule_selected(callback: CallbackQuery, state: FSMContext):
     """Выбрано расписание"""
+    await callback.answer()
     parts = callback.data.split(":")
     
     if parts[1] == "cancel":
@@ -1712,6 +1763,7 @@ async def batch_schedule_selected(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("shuffle:"))
 async def batch_shuffle_selected(callback: CallbackQuery, state: FSMContext):
     """Выбор перемешивания постов"""
+    await callback.answer()
     action = callback.data.split(":")[1]
     
     if action == "cancel":
@@ -1762,6 +1814,7 @@ async def batch_shuffle_selected(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "batch:confirm_publish")
 async def batch_publish_confirmed(callback: CallbackQuery, state: FSMContext):
     """Подтверждение публикации пакета — проверяем конфликт с активным"""
+    await callback.answer()
     data = await state.get_data()
     posts = data.get('posts', [])
     schedule = data.get('schedule', [])
@@ -1796,6 +1849,7 @@ async def batch_publish_confirmed(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("batch_conflict:"))
 async def batch_conflict_choice(callback: CallbackQuery, state: FSMContext):
     """Обработка выбора при конфликте пакетов"""
+    await callback.answer()
     action = callback.data.split(":")[1]
     if action == "cancel":
         await callback.message.edit_text("❌ Добавление пакета отменено")
@@ -1891,6 +1945,7 @@ async def my_hashtags_menu(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("myhash:"))
 async def my_hashtags_actions(callback: CallbackQuery, state: FSMContext):
     """Действия в меню хештегов"""
+    await callback.answer()
     parts = callback.data.split(":")
     action = parts[1]
     
@@ -2028,6 +2083,9 @@ async def draft_actions(callback: CallbackQuery, state: FSMContext):
     """Действия с черновиками"""
     parts = callback.data.split(":")
     action = parts[1]
+    
+    if action not in ("pub", "toq"):
+        await callback.answer()
     
     if action == "back":
         await callback.message.edit_text("👋 Главное меню")
@@ -2232,6 +2290,10 @@ async def show_queue(message: Message, state: FSMContext):
 async def queue_callback(callback: CallbackQuery, state: FSMContext):
     """Обработка действий с очередью"""
     action = callback.data.split(":")[1]
+    
+    # Answer callback to avoid timeout (skip for actions that show explicit answers)
+    if action not in ("start", "stop", "rm"):
+        await callback.answer()
     
     if action == "back":
         await callback.message.edit_text("👋 Главное меню")
@@ -2450,6 +2512,69 @@ async def queue_interval_set(message: Message, state: FSMContext):
             await message.answer("❌ Введите число от 1 до 1440")
     except ValueError:
         await message.answer("❌ Введите корректное число")
+
+# ============ НАСТРОЙКИ ============
+
+@router.message(F.text == "⚙️ Настройки")
+async def settings_menu(message: Message, state: FSMContext):
+    """Меню настроек"""
+    config = load_config()
+    desc_enabled = config.get('features', {}).get('post_description', False)
+    desc_status = "✅ Вкл" if desc_enabled else "❌ Выкл"
+    
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    await message.answer(
+        f"⚙️ <b>Настройки</b>\n\n"
+        f"📝 Описание поста: <b>{desc_status}</b>\n"
+        f"<i>Если включено — перед публикацией будет предложено добавить описание</i>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"📝 Описание постов: {desc_status}",
+                callback_data="settings:toggle_description"
+            )],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="settings:back")],
+        ]),
+        parse_mode='HTML'
+    )
+
+@router.callback_query(F.data.startswith("settings:"))
+async def settings_callback(callback: CallbackQuery, state: FSMContext):
+    """Обработка настроек"""
+    action = callback.data.split(":")[1]
+    
+    if action == "toggle_description":
+        config = load_config()
+        current = config.get('features', {}).get('post_description', False)
+        if 'features' not in config:
+            config['features'] = {}
+        config['features']['post_description'] = not current
+        save_config(config)
+        
+        new_val = not current
+        desc_status = "✅ Вкл" if new_val else "❌ Выкл"
+        await callback.answer(f"📝 Описание постов: {desc_status}")
+        
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        await callback.message.edit_text(
+            f"⚙️ <b>Настройки</b>\n\n"
+            f"📝 Описание поста: <b>{desc_status}</b>\n"
+            f"<i>Если включено — перед публикацией будет предложено добавить описание</i>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"📝 Описание постов: {desc_status}",
+                    callback_data="settings:toggle_description"
+                )],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="settings:back")],
+            ]),
+            parse_mode='HTML'
+        )
+        return
+    
+    if action == "back":
+        await callback.message.delete()
+        await callback.message.answer("Выберите действие:", reply_markup=main_menu())
+        return
+
 
 # ============ ОЧИСТКА ЧАТА ============
 
