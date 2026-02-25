@@ -107,6 +107,8 @@ def format_post_caption(category_data: Dict, selected_hashtags: List[str], platf
     
     platform_data = config['platforms'][platform_id]
     invite_link = platform_data.get('invite_link', 'https://t.me/your_channel')
+    platform_type = platform_data.get('type', 'group')
+    referral_bot = platform_data.get('referral_bot', '@Tag_Referral_bot')
     
     caption = f"{emoji} {name} {emoji}\n\n"
     caption += f"{emoji_row}\n"
@@ -117,6 +119,10 @@ def format_post_caption(category_data: Dict, selected_hashtags: List[str], platf
     
     if description:
         caption += f"{description}\n\n"
+    
+    # Для канала добавляем строку с реферальным ботом
+    if platform_type == 'channel':
+        caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
     
     caption += f"↘️⬇️↙️\n"
     caption += f'<a href="{invite_link}">Ссылка для друга</a>'
@@ -134,6 +140,8 @@ def format_comic_post(category_data: Dict, comic_title: str, comic_link: str,
     
     platform_data = config['platforms'][platform_id]
     invite_link = platform_data.get('invite_link', 'https://t.me/your_channel')
+    platform_type = platform_data.get('type', 'group')
+    referral_bot = platform_data.get('referral_bot', '@Tag_Referral_bot')
     
     # Основной контент - название комикса как гиперссылка
     caption = f"{emoji} {name} {emoji}\n\n"
@@ -150,6 +158,11 @@ def format_comic_post(category_data: Dict, comic_title: str, comic_link: str,
         caption += f"{hashtags_formatted}\n\n"
     
     caption += f"{emoji_row}\n\n"
+    
+    # Для канала добавляем строку с реферальным ботом
+    if platform_type == 'channel':
+        caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
+    
     caption += f"↘️⬇️↙️\n"
     caption += f'<a href="{invite_link}">Ссылка для друга</a>'
     
