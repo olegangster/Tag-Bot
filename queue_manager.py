@@ -337,12 +337,21 @@ class QueueManager:
 
             if isinstance(sched_time, str):
                 sched_time = datetime.fromisoformat(sched_time)
-            wait_sec = (sched_time - datetime.now()).total_seconds()
+            # Handle both naive and timezone-aware datetimes
+            if hasattr(sched_time, 'tzinfo') and sched_time.tzinfo is not None:
+                import pytz
+                now_aware = datetime.now(sched_time.tzinfo)
+                wait_sec = (sched_time - now_aware).total_seconds()
+            else:
+                wait_sec = (sched_time - datetime.now()).total_seconds()
             if wait_sec > 0:
                 logger.info(f"⏳ {batch_name} пост {i+1}/{total} через {wait_sec:.0f}с")
                 while wait_sec > 0 and self.running:
                     await asyncio.sleep(min(wait_sec, 5.0))
-                    wait_sec = (sched_time - datetime.now()).total_seconds()
+                    if hasattr(sched_time, 'tzinfo') and sched_time.tzinfo is not None:
+                        wait_sec = (sched_time - datetime.now(sched_time.tzinfo)).total_seconds()
+                    else:
+                        wait_sec = (sched_time - datetime.now()).total_seconds()
 
             if not self.running:
                 break
