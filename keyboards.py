@@ -24,8 +24,8 @@ def main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="➕ Создать пост"), KeyboardButton(text="📦 Пакетная загрузка")],
             [KeyboardButton(text="💾 Черновики"), KeyboardButton(text="📥 Очередь")],
-            [KeyboardButton(text="#️⃣ Мои хештеги"), KeyboardButton(text="🧹 Очистить чат")],
-            [KeyboardButton(text="🏠 Главная")],
+            [KeyboardButton(text="#️⃣ Мои хештеги"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="🧹 Очистить чат"), KeyboardButton(text="🏠 Главная")],
         ],
         resize_keyboard=True,
     )
