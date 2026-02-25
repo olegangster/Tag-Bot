@@ -34,13 +34,15 @@
           "name": "Порно",
           "thread_id": 16
         }
-      }
+      },
+      "referral_bot": "@Tag_Referral_bot"
     },
     "main_channel": {
       "name": "Основной канал",
       "chat_id": -1003829715647,
       "type": "channel",
-      "invite_link": "https://t.me/+GqZPjm0RLR9iOTQy"
+      "invite_link": "https://t.me/+GqZPjm0RLR9iOTQy",
+      "referral_bot": "@Tag_Referral_bot"
     }
   },
   "participants": {
