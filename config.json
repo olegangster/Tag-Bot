@@ -860,7 +860,8 @@
     "custom_hashtags": true,
     "multiple_batch_uploads": true,
     "preview_before_post": true,
-    "smart_interval_calculation": true
+    "smart_interval_calculation": true,
+    "post_description": false
   },
   "experimental": {
     "enabled": true,
