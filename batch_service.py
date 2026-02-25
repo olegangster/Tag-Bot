@@ -221,22 +221,29 @@ class BatchPostingService:
         # Название категории с эмодзи
         category_title = f"{category_data['emoji']} {category_data['name'].upper()} {category_data['emoji']}"
         
-        # Форматируем хештеги по 4 в ряд
+        # Форматируем хештеги по 3 в ряд
         hashtag_rows = []
-        for i in range(0, len(hashtags), 4):
-            row = ' '.join(hashtags[i:i+4])
+        for i in range(0, len(hashtags), 3):
+            row = ' '.join(hashtags[i:i+3])
             hashtag_rows.append(row)
         hashtags_formatted = '\n'.join(hashtag_rows)
         
-        # Получаем ссылку-приглашение
+        # Получаем данные платформы
         platform_data = self.config['platforms'][platform_id]
         invite_link = platform_data.get('invite_link', 'https://t.me/your_channel')
+        platform_type = platform_data.get('type', 'group')
+        referral_bot = platform_data.get('referral_bot', '@Tag_Referral_bot')
         
-        # Собираем пост по образцу
+        # Собираем пост
         caption = f"{category_title}\n\n"
         caption += f"{emoji_row}\n"
         caption += f"{hashtags_formatted}\n"
         caption += f"{emoji_row}\n\n"
+        
+        # Для канала добавляем строку с реферальным ботом
+        if platform_type == 'channel':
+            caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
+        
         caption += f"↘️⬇️↙️\n"
         caption += f'<a href="{invite_link}">Ссылка для друга</a>'
         
