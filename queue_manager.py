@@ -283,10 +283,12 @@ class QueueManager:
             invite_link = platform_cfg.get("invite_link", "https://t.me/your_channel")
             platform_type = platform_cfg.get("type", "group")
             referral_bot = platform_cfg.get("referral_bot", "@Tag_Referral_bot")
+            comic_link = item.get("comic_link", "")
+            comic_title = item.get("comic_title", "")
             caption = (
                 f"{category_data['emoji']} {category_data['name'].upper()} {category_data['emoji']}\n\n"
                 f"{category_data.get('emoji_row', '')}\n\n"
-                f'📖 <b><u><a href="{item.get("comic_link","")}">{ item.get("comic_title","")}</a></u></b>\n\n'
+                f'📖 <b><u><a href="{comic_link}">{comic_title}</a></u></b>\n\n'
                 f"{category_data.get('emoji_row', '')}\n\n"
             )
             if platform_type == "channel":
@@ -388,7 +390,6 @@ class QueueManager:
         if rows:
             caption += "\n".join(rows) + "\n"
         caption += f"{emoji_row}\n\n"
-        # Для канала добавляем строку с реферальным ботом
         if platform_type == "channel":
             caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
         caption += f"↘️⬇️↙️\n"
