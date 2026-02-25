@@ -837,7 +837,7 @@
     "opacity": 0.8,
     "scale": 0.25,
     "scale_photo": 0.15,
-    "scale_video": 0.15,
+    "scale_video": 0.09,
     "padding": 15
   },
   "batch_mode": {
