@@ -281,14 +281,18 @@ class QueueManager:
 
         if item.get("is_comic"):
             invite_link = platform_cfg.get("invite_link", "https://t.me/your_channel")
+            platform_type = platform_cfg.get("type", "group")
+            referral_bot = platform_cfg.get("referral_bot", "@Tag_Referral_bot")
             caption = (
                 f"{category_data['emoji']} {category_data['name'].upper()} {category_data['emoji']}\n\n"
                 f"{category_data.get('emoji_row', '')}\n\n"
                 f'📖 <b><u><a href="{item.get("comic_link","")}">{ item.get("comic_title","")}</a></u></b>\n\n'
                 f"{category_data.get('emoji_row', '')}\n\n"
-                f"↘️⬇️↙️\n"
-                f'<a href="{invite_link}">Ссылка для друга</a>'
             )
+            if platform_type == "channel":
+                caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
+            caption += f"↘️⬇️↙️\n"
+            caption += f'<a href="{invite_link}">Ссылка для друга</a>'
             kwargs = dict(chat_id=chat_id, text=caption, parse_mode="HTML")
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
@@ -375,11 +379,18 @@ class QueueManager:
         config = load_config()
         emoji_row = category_data.get("emoji_row", "")
         title = f"{category_data['emoji']} {category_data['name'].upper()} {category_data['emoji']}"
-        rows = [" ".join(hashtags[i:i+4]) for i in range(0, len(hashtags), 4)]
-        invite_link = config.get("platforms", {}).get(platform_id, {}).get("invite_link", "https://t.me/your_channel")
+        rows = [" ".join(hashtags[i:i+3]) for i in range(0, len(hashtags), 3)]
+        platform_cfg = config.get("platforms", {}).get(platform_id, {})
+        invite_link = platform_cfg.get("invite_link", "https://t.me/your_channel")
+        platform_type = platform_cfg.get("type", "group")
+        referral_bot = platform_cfg.get("referral_bot", "@Tag_Referral_bot")
         caption = f"{title}\n\n{emoji_row}\n"
         if rows:
             caption += "\n".join(rows) + "\n"
-        caption += f"{emoji_row}\n\n↘️⬇️↙️\n"
+        caption += f"{emoji_row}\n\n"
+        # Для канала добавляем строку с реферальным ботом
+        if platform_type == "channel":
+            caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
+        caption += f"↘️⬇️↙️\n"
         caption += f'<a href="{invite_link}">Ссылка для друга</a>'
         return caption
