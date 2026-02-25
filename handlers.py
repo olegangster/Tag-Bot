@@ -1449,15 +1449,14 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
     """Действия с выбором времени"""
     parts = callback.data.split(":")
     action = parts[1]
+    # Re-read fresh state every time to avoid stale data
     data = await state.get_data()
     posts_per_day = data.get('posts_per_day', 1)
-    await callback.answer()
     
     if action == "preset":
         # Выбран готовый вариант
         preset_index = int(parts[2])
         
-        # Генерируем готовые варианты (дублируем логику из клавиатуры)
         if posts_per_day == 1:
             presets = [["12:00"], ["15:00"], ["18:00"], ["20:00"]]
         elif posts_per_day == 2:
@@ -1480,15 +1479,15 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
         
         selected_times = presets[preset_index] if preset_index < len(presets) else []
         await state.update_data(selected_times=selected_times)
+        await callback.answer(f"✅ {', '.join(selected_times)}")
         
         await callback.message.edit_reply_markup(
             reply_markup=time_slots_keyboard(posts_per_day, selected_times)
         )
-        await callback.answer(f"✅ Выбрано время: {', '.join(selected_times)}")
         return
     
     elif action == "custom":
-        # Ввести своё время
+        await callback.answer()
         await state.set_state(PostFlow.custom_schedule_input_time)
         await callback.message.answer(
             f"✏️ <b>Ввод времени</b>\n\n"
@@ -1505,9 +1504,10 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
         return
     
     elif action == "done":
-        # Готово - генерация расписания
-        selected_times = data.get('selected_times', [])
-        selected_dates = data.get('selected_dates', [])
+        # Re-read fresh state
+        fresh_data = await state.get_data()
+        selected_times = fresh_data.get('selected_times', [])
+        selected_dates = fresh_data.get('selected_dates', [])
         
         if not selected_times:
             await callback.answer("❌ Выберите время публикации!", show_alert=True)
@@ -1516,10 +1516,9 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
         # Генерируем расписание по графику
         schedule = generate_custom_schedule(selected_dates, selected_times)
         
-        data = await state.get_data()
-        media_files = data.get('media_files', [])
+        media_files = fresh_data.get('media_files', [])
         media_files.sort(key=lambda x: x[3] if len(x) > 3 else 0)
-        files_per_post = data.get('files_per_post', 1)
+        files_per_post = fresh_data.get('files_per_post', 1)
         
         # Разбиваем на посты
         posts = []
@@ -1529,10 +1528,9 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
         # Проверяем что хватает времен в расписании
         if len(schedule) < len(posts):
             await callback.answer(
-                f"⚠️ Недостаточно слотов времени!\n\n"
-                f"Постов: {len(posts)}\n"
-                f"Слотов: {len(schedule)}\n\n"
-                f"Выберите больше дней или увеличьте количество постов в день",
+                f"⚠️ Недостаточно слотов!\n"
+                f"Постов: {len(posts)}, слотов: {len(schedule)}\n"
+                f"Выберите больше дней или постов в день",
                 show_alert=True
             )
             return
@@ -1544,9 +1542,11 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
             schedule=schedule,
             posts=posts,
             batch_step='confirm',
-            time_category='custom',  # Для отображения
-            time_value=len(selected_dates)  # Для отображения
+            time_category='custom',
+            time_value=len(selected_dates)
         )
+        
+        await callback.answer(f"✅ График создан: {len(posts)} постов")
         
         # Показываем summary
         summary_text = (
@@ -1571,14 +1571,14 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
         return
     
     elif action == "back":
-        # Назад к выбору постов в день
+        await callback.answer()
         await state.set_state(PostFlow.custom_schedule_posts_per_day)
         
-        data = await state.get_data()
-        media_files = data.get('media_files', [])
-        files_per_post = data.get('files_per_post', 1)
+        fresh = await state.get_data()
+        media_files = fresh.get('media_files', [])
+        files_per_post = fresh.get('files_per_post', 1)
         total_posts = len(media_files) // files_per_post + (1 if len(media_files) % files_per_post else 0)
-        selected_dates = data.get('selected_dates', [])
+        selected_dates = fresh.get('selected_dates', [])
         
         await callback.message.edit_text(
             f"✅ Выбрано дней: <b>{len(selected_dates)}</b>\n\n"
