@@ -21,7 +21,6 @@ else
   echo "Using cached ffmpeg..."
 fi
 
-# ВАЖНО: ставим зависимости из папки проекта (/src)
 cd "$PROJECT_DIR"
 
 if [ -f "requirements.txt" ]; then
