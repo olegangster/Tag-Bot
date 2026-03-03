@@ -6,14 +6,14 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
-# ✅ logging ПЕРВЫМ — до всех импортов которые логируют
+# logging ПЕРВЫМ
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-from handlers import router, queue_mgr  # queue_mgr для авто-старта
+from handlers import router, queue_mgr
 
 try:
     from keep_alive import start_keep_alive_server
@@ -28,15 +28,13 @@ load_dotenv(".env.txt")
 
 async def _autostart_queue(bot: Bot):
     """
-    ✅ КРИТИЧНО: Авто-старт очереди после перезапуска Render.
-
-    Render перезапускает сервис при каждом деплое и периодически сам.
-    queue.json сохраняется, но running=False — посты зависают навсегда.
+    Авто-старт очереди после перезапуска Render.
+    queue.json сохраняется, но running=False — посты зависают.
     Эта функция автоматически возобновляет публикацию.
     """
     from media_processor import MediaProcessor
 
-    pending = queue_mgr.get_pending_queue()  # все элементы без фильтра
+    pending = queue_mgr.get_pending_queue()
     if not pending:
         logger.info("📭 Очередь пуста — авто-старт не нужен")
         return
@@ -69,7 +67,7 @@ async def main():
         if _has_keep_alive:
             asyncio.create_task(start_keep_alive_server())
 
-        # ✅ Авто-старт очереди — ОБЯЗАТЕЛЬНО перед polling
+        # Авто-старт очереди — ОБЯЗАТЕЛЬНО перед polling
         await _autostart_queue(bot)
 
         await dp.start_polling(bot)
