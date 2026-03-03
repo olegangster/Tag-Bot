@@ -78,6 +78,30 @@ def media_upload_keyboard(count: int) -> ReplyKeyboardMarkup:
     )
 
 
+# ============ ТИП ПОСТА (обычный / за звёзды) ============
+
+def post_type_keyboard() -> InlineKeyboardMarkup:
+    """Выбор типа поста для канала"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Обычный пост", callback_data="posttype:normal")],
+            [InlineKeyboardButton(text="⭐ Пост за Звёзды", callback_data="posttype:stars")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="posttype:cancel")],
+        ]
+    )
+
+
+def batch_post_type_keyboard() -> InlineKeyboardMarkup:
+    """Выбор типа постов для пакетной отправки на канал"""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Обычные посты", callback_data="batch_posttype:normal")],
+            [InlineKeyboardButton(text="⭐ Посты за Звёзды", callback_data="batch_posttype:stars")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="schedule:cancel")],
+        ]
+    )
+
+
 # ============ ХЕШТЕГИ ============
 
 def hashtags_keyboard(
@@ -89,7 +113,6 @@ def hashtags_keyboard(
 ) -> InlineKeyboardMarkup:
     rows = []
 
-    # Хештеги по 3 в ряд
     row = []
     for tag in all_hashtags:
         check = "✅ " if tag in selected else ""
@@ -100,7 +123,6 @@ def hashtags_keyboard(
     if row:
         rows.append(row)
 
-    # Управляющие кнопки
     rows.append([
         InlineKeyboardButton(text="✅ Все", callback_data="tag:select_all"),
         InlineKeyboardButton(text="❌ Сброс", callback_data="tag:clear_all"),
@@ -174,7 +196,6 @@ def comic_confirm_keyboard() -> InlineKeyboardMarkup:
 # ============ ПАКЕТНАЯ ЗАГРУЗКА ============
 
 def files_per_post_keyboard() -> InlineKeyboardMarkup:
-    """Сколько файлов в одном посте"""
     rows = []
     row = []
     for n in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
@@ -189,7 +210,6 @@ def files_per_post_keyboard() -> InlineKeyboardMarkup:
 
 
 def schedule_type_keyboard() -> InlineKeyboardMarkup:
-    """Выбор типа расписания: обычное или график"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⏰ Обычное расписание", callback_data="sched_type:normal")],
@@ -200,7 +220,6 @@ def schedule_type_keyboard() -> InlineKeyboardMarkup:
 
 
 def batch_schedule_keyboard() -> InlineKeyboardMarkup:
-    """Выбор единицы времени для расписания"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -217,7 +236,6 @@ def batch_schedule_keyboard() -> InlineKeyboardMarkup:
 
 
 def time_options_keyboard(time_cat: str) -> InlineKeyboardMarkup:
-    """Выбор конкретного значения времени"""
     options = {
         "minute": [5, 10, 15, 20, 30, 45, 60, 90, 120],
         "hour":   [1, 2, 3, 4, 6, 8, 12, 18, 24],
@@ -254,7 +272,6 @@ def time_options_keyboard(time_cat: str) -> InlineKeyboardMarkup:
 
 
 def batch_shuffle_keyboard() -> InlineKeyboardMarkup:
-    """Перемешать посты или нет"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -267,7 +284,6 @@ def batch_shuffle_keyboard() -> InlineKeyboardMarkup:
 
 
 def confirm_batch_final_keyboard(posts_count: int) -> InlineKeyboardMarkup:
-    """Финальное подтверждение публикации пакета"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -288,10 +304,7 @@ def drafts_list_keyboard(user_drafts: Dict) -> InlineKeyboardMarkup:
     for draft_id, draft in user_drafts.items():
         name = draft.get("name", draft_id)
         rows.append([
-            InlineKeyboardButton(
-                text=f"📄 {name}",
-                callback_data=f"dr:open:{draft_id}"
-            )
+            InlineKeyboardButton(text=f"📄 {name}", callback_data=f"dr:open:{draft_id}")
         ])
     rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="dr:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -331,15 +344,10 @@ def queue_menu_keyboard(running: bool, count: int, interval: int, has_running_ba
 
 
 def queue_list_keyboard(items: List[Dict], running: bool = False, active_ids: set = None) -> InlineKeyboardMarkup:
-    """
-    items — результат get_queue() (активные + ожидающие).
-    Активные помечены _is_running=True — показываем без кнопки удаления.
-    Для ожидающих индекс считается относительно pending-части (без running).
-    """
     if active_ids is None:
         active_ids = set()
     rows = []
-    pending_index = 0  # индекс в ожидающей очереди
+    pending_index = 0
     for item in items:
         name = item.get("name", "Пост")
         item_type = item.get("type", "single")
@@ -373,7 +381,6 @@ def queue_list_keyboard(items: List[Dict], running: bool = False, active_ids: se
 
 
 def queue_item_detail_keyboard(index: int, is_active: bool) -> InlineKeyboardMarkup:
-    """Клавиатура для детального просмотра элемента очереди"""
     rows = []
     if is_active:
         rows.append([InlineKeyboardButton(
@@ -390,21 +397,10 @@ def queue_item_detail_keyboard(index: int, is_active: bool) -> InlineKeyboardMar
 
 
 def batch_conflict_keyboard() -> InlineKeyboardMarkup:
-    """Выбор режима при конфликте пакетов"""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔀 Совместить — чередовать посты",
-                    callback_data="batch_conflict:interleave"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📅 После текущего пакета",
-                    callback_data="batch_conflict:after"
-                )
-            ],
+            [InlineKeyboardButton(text="🔀 Совместить — чередовать посты", callback_data="batch_conflict:interleave")],
+            [InlineKeyboardButton(text="📅 После текущего пакета", callback_data="batch_conflict:after")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="batch_conflict:cancel")],
         ]
     )
@@ -423,7 +419,6 @@ def my_hashtags_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def user_templates_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Список категорий с шаблонами"""
     config = load_config()
     user_str = str(user_id)
     user_templates = config.get("hashtag_templates", {}).get(user_str, {})
@@ -431,7 +426,6 @@ def user_templates_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = []
     for cat_key, templates in user_templates.items():
         if templates:
-            # Находим название категории
             cat_name = cat_key
             for p_key, p_data in config.get("participants", {}).items():
                 if p_data.get("user_id") == user_id:
@@ -454,7 +448,6 @@ def user_templates_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def category_templates_keyboard(user_id: int, cat_key: str) -> InlineKeyboardMarkup:
-    """Список шаблонов категории"""
     config = load_config()
     user_str = str(user_id)
     templates = (
@@ -482,18 +475,8 @@ def category_templates_keyboard(user_id: int, cat_key: str) -> InlineKeyboardMar
 def template_actions_keyboard(cat_key: str, template_name: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🗑️ Удалить шаблон",
-                    callback_data=f"myhash:delete:{cat_key}:{template_name}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔙 Назад",
-                    callback_data=f"myhash:cat:{cat_key}"
-                )
-            ],
+            [InlineKeyboardButton(text="🗑️ Удалить шаблон", callback_data=f"myhash:delete:{cat_key}:{template_name}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data=f"myhash:cat:{cat_key}")],
         ]
     )
 
@@ -501,45 +484,38 @@ def template_actions_keyboard(cat_key: str, template_name: str) -> InlineKeyboar
 # ============ СОЗДАНИЕ ГРАФИКА ПУБЛИКАЦИЙ ============
 
 def date_selection_keyboard(selected_dates: List[str] = None) -> InlineKeyboardMarkup:
-    """
-    Клавиатура для выбора дат (следующие 14 дней)
-    selected_dates: список выбранных дат в формате "DD.MM"
-    """
     from datetime import datetime, timedelta
     import pytz
-    
+
     if selected_dates is None:
         selected_dates = []
-    
-    # Киевское время (UTC+2 зимой, UTC+3 летом)
+
     kyiv_tz = pytz.timezone('Europe/Kiev')
     now = datetime.now(kyiv_tz)
-    
+
     rows = []
     row = []
-    
+
     for i in range(14):
         date = now + timedelta(days=i)
         date_str = date.strftime("%d.%m")
         day_name = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][date.weekday()]
-        
-        # Подсветка выбранных дат
+
         prefix = "✅ " if date_str in selected_dates else ""
         label = f"{prefix}{day_name} {date_str}"
-        
+
         row.append(InlineKeyboardButton(
             text=label,
             callback_data=f"customdate:toggle:{date_str}"
         ))
-        
+
         if len(row) == 3:
             rows.append(row)
             row = []
-    
+
     if row:
         rows.append(row)
-    
-    # Управляющие кнопки
+
     rows.append([
         InlineKeyboardButton(text="✅ Выбрать все", callback_data="customdate:all"),
         InlineKeyboardButton(text="❌ Сброс", callback_data="customdate:clear"),
@@ -548,56 +524,39 @@ def date_selection_keyboard(selected_dates: List[str] = None) -> InlineKeyboardM
         InlineKeyboardButton(text="✔️ Готово", callback_data="customdate:done"),
         InlineKeyboardButton(text="🔙 Назад", callback_data="customdate:back"),
     ])
-    
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def posts_per_day_keyboard() -> InlineKeyboardMarkup:
-    """Выбор количества постов в день"""
     rows = []
     row = []
-    
+
     for n in range(1, 13):
-        row.append(InlineKeyboardButton(
-            text=str(n),
-            callback_data=f"postsperday:{n}"
-        ))
+        row.append(InlineKeyboardButton(text=str(n), callback_data=f"postsperday:{n}"))
         if len(row) == 4:
             rows.append(row)
             row = []
-    
+
     if row:
         rows.append(row)
-    
+
     rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="postsperday:back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def time_slots_keyboard(posts_per_day: int, selected_times: List[str] = None) -> InlineKeyboardMarkup:
-    """
-    Предлагает готовые графики времени + возможность ввести своё
-    selected_times: список выбранных времен в формате "HH:MM"
-    """
     if selected_times is None:
         selected_times = []
-    
+
     rows = []
-    
-    # Готовые варианты времени в зависимости от количества постов
+
     if posts_per_day == 1:
         presets = [["12:00"], ["15:00"], ["18:00"], ["20:00"]]
     elif posts_per_day == 2:
-        presets = [
-            ["10:00", "18:00"],
-            ["12:00", "20:00"],
-            ["14:00", "22:00"],
-        ]
+        presets = [["10:00", "18:00"], ["12:00", "20:00"], ["14:00", "22:00"]]
     elif posts_per_day == 3:
-        presets = [
-            ["10:00", "15:00", "20:00"],
-            ["12:00", "16:00", "20:00"],
-            ["14:00", "18:00", "22:00"],
-        ]
+        presets = [["10:00", "15:00", "20:00"], ["12:00", "16:00", "20:00"], ["14:00", "18:00", "22:00"]]
     elif posts_per_day == 4:
         presets = [
             ["09:00", "13:00", "17:00", "21:00"],
@@ -610,7 +569,6 @@ def time_slots_keyboard(posts_per_day: int, selected_times: List[str] = None) ->
             ["10:00", "13:00", "16:00", "19:00", "22:00"],
         ]
     else:
-        # Для 6+ постов генерируем равномерное распределение
         interval_hours = 24 // posts_per_day
         presets = []
         for start in [8, 9, 10]:
@@ -619,29 +577,24 @@ def time_slots_keyboard(posts_per_day: int, selected_times: List[str] = None) ->
                 hour = (start + i * interval_hours) % 24
                 times.append(f"{hour:02d}:00")
             presets.append(times)
-    
-    # Показываем готовые варианты
+
     for i, preset in enumerate(presets):
         time_str = ", ".join(preset)
-        # Подсветка если выбран этот вариант
         is_selected = set(selected_times) == set(preset)
         prefix = "✅ " if is_selected else ""
         rows.append([InlineKeyboardButton(
             text=f"{prefix}{time_str}",
             callback_data=f"timeslot:preset:{i}"
         )])
-    
-    rows.append([InlineKeyboardButton(
-        text="✏️ Ввести своё время",
-        callback_data="timeslot:custom"
-    )])
-    
+
+    rows.append([InlineKeyboardButton(text="✏️ Ввести своё время", callback_data="timeslot:custom")])
+
     if selected_times:
         rows.append([InlineKeyboardButton(
             text=f"✔️ Готово ({len(selected_times)} времен)",
             callback_data="timeslot:done"
         )])
-    
+
     rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="timeslot:back")])
-    
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
