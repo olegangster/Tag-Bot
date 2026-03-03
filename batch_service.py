@@ -198,7 +198,7 @@ class BatchPostingService:
         caption += f"{emoji_row}\n\n"
 
         if platform_type == 'channel':
-            caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
+            caption += f"Получить бесплатно доступ к приватке ➡️ {referral_bot}\n"
 
         caption += f"↘️⬇️↙️\n"
         caption += f'<a href="{invite_link}">Ссылка для друга</a>'
