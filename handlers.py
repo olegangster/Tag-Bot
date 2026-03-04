@@ -1355,6 +1355,10 @@ async def save_to_queue_with_name(message: Message, state: FSMContext):
         topic=data.get('topic')
     )
 
+    # ✅ Убеждаемся что цикл очереди запущен
+    media_proc = MediaProcessor(message.bot)
+    await queue_mgr.start_queue(media_proc, message.bot)
+
     await message.answer(
         f"📥 Добавлено в очередь!\n\n"
         f"📄 Название: <b>{name}</b>\n"
@@ -1979,11 +1983,11 @@ async def _do_add_batch_to_queue(callback: CallbackQuery, state: FSMContext, mod
     )
 
     media_proc = MediaProcessor(callback.message.bot)
+    await queue_mgr.start_queue(media_proc, callback.message.bot)
     if not queue_mgr.running:
-        await queue_mgr.start_queue(media_proc, callback.message.bot)
         mode_emoji = "▶️ Запущен и публикуется"
     else:
-        mode_emoji = "✅ Добавлен, публикуется параллельно"
+        mode_emoji = "✅ Добавлен в очередь"
 
     first_dt = schedule_dt[0] if schedule_dt else datetime.now()
     last_dt = schedule_dt[-1] if len(schedule_dt) > 1 else first_dt
@@ -2336,23 +2340,19 @@ async def queue_callback(callback: CallbackQuery, state: FSMContext):
 
     if action == "start":
         processor = MediaProcessor(callback.message.bot)
-        success = await queue_mgr.start_queue(processor, callback.message.bot)
-
-        if success:
-            await callback.answer("✅ Очередь запущена")
-            status = queue_mgr.get_status(user_id)
-            await callback.message.edit_text(
-                queue_mgr.get_status_text(user_id),
-                reply_markup=queue_menu_keyboard(
-                    running=status['running'],
-                    count=status['pending'],
-                    interval=status['interval'],
-                    has_running_batches=bool(status.get('running_batches'))
-                ),
-                parse_mode='HTML'
-            )
-        else:
-            await callback.answer("❌ Нет постов для публикации", show_alert=True)
+        await queue_mgr.start_queue(processor, callback.message.bot)
+        await callback.answer("✅ Очередь запущена")
+        status = queue_mgr.get_status(user_id)
+        await callback.message.edit_text(
+            queue_mgr.get_status_text(user_id),
+            reply_markup=queue_menu_keyboard(
+                running=status['running'],
+                count=status['pending'],
+                interval=status['interval'],
+                has_running_batches=bool(status.get('running_batches'))
+            ),
+            parse_mode='HTML'
+        )
         return
 
     if action == "stop":
