@@ -26,21 +26,22 @@ load_dotenv(".env.txt")
 
 async def _autostart_queue(bot: Bot):
     from media_processor import MediaProcessor
+    media_proc = MediaProcessor(bot)
+    # ✅ Всегда запускаем цикл очереди — он будет ждать новых элементов в фоне.
+    # Это необходимо чтобы после перезапуска очередь сразу принимала новые пакеты.
+    started = await queue_mgr.start_queue(media_proc, bot)
     has_pending = bool(queue_mgr.get_pending_queue())
     has_running = bool(queue_mgr._running_batch_items)
-    if not has_pending and not has_running:
-        logger.info("Очередь пуста — авто-старт не нужен")
-        return
-    logger.info(
-        f"Авто-старт: {len(queue_mgr.get_pending_queue())} ожидающих + "
-        f"{len(queue_mgr._running_batch_items)} возобновляемых"
-    )
-    media_proc = MediaProcessor(bot)
-    started = await queue_mgr.start_queue(media_proc, bot)
-    if started:
-        logger.info("Очередь авто-запущена!")
+    if has_running:
+        logger.info(
+            f"Авто-старт: {len(queue_mgr.get_pending_queue())} ожидающих + "
+            f"{len(queue_mgr._running_batch_items)} возобновляемых"
+        )
+        logger.info("Очередь авто-запущена и восстанавливает активные пакеты!")
+    elif has_pending:
+        logger.info(f"Авто-старт: {len(queue_mgr.get_pending_queue())} ожидающих элементов")
     else:
-        logger.warning("Авто-старт не удался")
+        logger.info("Цикл очереди запущен в режиме ожидания (очередь пуста)")
 
 
 async def main():
