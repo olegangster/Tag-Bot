@@ -121,7 +121,7 @@ def format_post_caption(category_data: Dict, selected_hashtags: List[str], platf
         caption += f"{description}\n\n"
 
     if platform_type == 'channel':
-        caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
+        caption += f"Получить бесплатно доступ к приватке ➡️ {referral_bot}\n"
 
     caption += f"↘️⬇️↙️\n"
     caption += f'<a href="{invite_link}">Ссылка для друга</a>'
@@ -157,7 +157,7 @@ def format_comic_post(category_data: Dict, comic_title: str, comic_link: str,
     caption += f"{emoji_row}\n\n"
 
     if platform_type == 'channel':
-        caption += f"Получить бесплатно доступ к группе ➡️ {referral_bot}\n"
+        caption += f"Получить бесплатно доступ к приватке ➡️ {referral_bot}\n"
 
     caption += f"↘️⬇️↙️\n"
     caption += f'<a href="{invite_link}">Ссылка для друга</a>'
@@ -828,6 +828,64 @@ async def hashtag_selection(callback: CallbackQuery, state: FSMContext):
         await state.set_state(HashtagFlow.adding_custom)
         return
 
+    if action == "delete_mode_on":
+        await callback.answer()
+        await callback.message.edit_text(
+            "🗑️ <b>Удаление хештегов</b>\n\n"
+            "Нажмите на хештег чтобы удалить его из списка навсегда:",
+            reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key, delete_mode=True),
+            parse_mode='HTML'
+        )
+        return
+
+    if action == "delete_mode_off":
+        await callback.answer()
+        await callback.message.edit_text(
+            "🏷 <b>Выберите хештеги:</b>",
+            reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key),
+            parse_mode='HTML'
+        )
+        return
+
+    if action.startswith("del:"):
+        tag_to_delete = action[4:]
+        await callback.answer()
+
+        # Удаляем из config.json
+        config = load_config()
+        deleted = False
+        for p_key, p_data in config.get('participants', {}).items():
+            if p_data.get('user_id') == callback.from_user.id:
+                cats = p_data.get('categories', {})
+                if cat_key in cats:
+                    hashtags_list = cats[cat_key].get('hashtags', [])
+                    if tag_to_delete in hashtags_list:
+                        hashtags_list.remove(tag_to_delete)
+                        cats[cat_key]['hashtags'] = hashtags_list
+                        save_config(config)
+                        deleted = True
+                        break
+
+        if deleted:
+            # Обновляем category_data и all_hashtags в state
+            category_data['hashtags'] = [h for h in all_hashtags if h != tag_to_delete]
+            all_hashtags = category_data['hashtags']
+            # Убираем из selected если был выбран
+            selected = [h for h in selected if h != tag_to_delete]
+            await state.update_data(
+                category_data=category_data,
+                selected_hashtags=selected
+            )
+            await callback.message.edit_text(
+                f"✅ Хештег <b>{tag_to_delete}</b> удалён\n\n"
+                "🗑️ <b>Удаление хештегов</b>\n\nНажмите на хештег чтобы удалить:",
+                reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key, delete_mode=True),
+                parse_mode='HTML'
+            )
+        else:
+            await callback.answer("⚠️ Хештег не найден в списке", show_alert=True)
+        return
+
     if action == "save_template":
         if not selected:
             await callback.answer("❌ Выберите хотя бы один хештег", show_alert=True)
@@ -1033,7 +1091,9 @@ async def custom_hashtag_received(message: Message, state: FSMContext):
                 break
 
     all_hashtags = category_data.get('hashtags', [])
-    selected = data.get('selected_hashtags', [])
+    # ✅ ИСПРАВЛЕНО: перечитываем selected из state (он мог обновиться внутри цикла)
+    fresh_data = await state.get_data()
+    selected = fresh_data.get('selected_hashtags', [])
 
     await state.set_state(PostFlow.selecting_hashtags)
     await message.answer(
