@@ -427,12 +427,13 @@ class QueueManager:
     async def start_queue(self, media_processor, bot) -> bool:
         """
         ✅ ИСПРАВЛЕНО: запускает очередь.
-        Теперь также запускает восстановленные активные пакеты из running_batches.json
+        - Перезапускает цикл, если предыдущий завершился (даже при running=True).
+        - Запускает восстановленные активные пакеты из running_batches.json.
+        - Всегда принимает новые элементы даже когда очередь была пуста.
         """
-        has_work = bool(self._queue) or bool(self._running_batch_items)
-        if not has_work:
-            return False
-        if self.running and self._task and not self._task.done():
+        # Если цикл жив — не запускаем повторно
+        if self._task and not self._task.done():
+            self.running = True
             return True
 
         from batch_service import BatchPostingService
@@ -460,16 +461,19 @@ class QueueManager:
     async def _process_queue_loop(self, media_processor, bot):
         """
         Главный цикл очереди.
-        ✅ ИСПРАВЛЕНО: При старте сначала возобновляет прерванные пакеты из
-        running_batches.json, затем берёт новые из _queue.
+        ✅ ИСПРАВЛЕНО:
+        - Цикл НЕ завершается когда очередь пуста — ждёт новых элементов.
+        - Завершается только при явном stop_queue() или CancelledError.
+        - Восстанавливает прерванные пакеты из running_batches.json при старте.
+        - Корректная отслеживание batch-задач по ID.
         """
         logger.info("▶️ Цикл очереди запущен")
-        batch_tasks: list = []
+        batch_tasks: dict = {}  # batch_id -> asyncio.Task
 
         # ✅ ВОССТАНОВЛЕНИЕ: Если после перезапуска есть активные пакеты —
         # запускаем их сразу, пропуская уже опубликованные посты
         for batch_id, item in list(self._running_batch_items.items()):
-            if not any(bid == batch_id for bid, _ in batch_tasks):
+            if batch_id not in batch_tasks:
                 logger.info(
                     f"🔄 Возобновляем пакет '{item.get('name')}' "
                     f"(опубликовано: {item.get('published_count', 0)}/{len(item.get('posts', []))})"
@@ -477,16 +481,16 @@ class QueueManager:
                 task = asyncio.create_task(
                     self._publish_batch(batch_id, item, media_processor, bot)
                 )
-                batch_tasks.append((batch_id, task))
+                batch_tasks[batch_id] = task
 
         while self.running:
-            # Убираем завершённые задачи из списка
-            batch_tasks = [(bid, t) for bid, t in batch_tasks if not t.done()]
+            # Убираем завершённые задачи из словаря
+            for bid in list(batch_tasks.keys()):
+                if batch_tasks[bid].done():
+                    del batch_tasks[bid]
 
-            # Очередь пуста — проверяем есть ли активные задачи
+            # Очередь пуста — ждём новых элементов (НЕ выходим из цикла!)
             if not self._queue:
-                if not batch_tasks:
-                    break  # Всё готово
                 await asyncio.sleep(2)
                 continue
 
@@ -511,7 +515,7 @@ class QueueManager:
                     task = asyncio.create_task(
                         self._publish_batch(item["id"], running_item, media_processor, bot)
                     )
-                    batch_tasks.append((item["id"], task))
+                    batch_tasks[item["id"]] = task
 
                     self._queue.pop(0)
                     self._save_queue()
@@ -527,7 +531,7 @@ class QueueManager:
                         self._save_queue()
 
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
                 logger.error(f"Ошибка публикации: {e}")
                 if self._queue and self._queue[0].get("id") == item.get("id"):
@@ -537,35 +541,25 @@ class QueueManager:
             self._active_id = None
             self._active_progress = ""
 
+            # Пауза между одиночными постами (только если есть ещё элементы в очереди)
             if self._queue and self.running:
                 await asyncio.sleep(self.interval * 60)
 
-        # Финальное ожидание незавершённых batch-задач
-        batch_tasks = [(bid, t) for bid, t in batch_tasks if not t.done()]
-        if batch_tasks:
-            logger.info(f"⏳ Ожидание завершения {len(batch_tasks)} активных пакетов...")
-            done_event = asyncio.Event()
-
-            async def wait_all():
-                for batch_id, task in batch_tasks:
-                    try:
-                        await task
-                    except Exception as e:
-                        logger.error(f"Ошибка пакета {batch_id}: {e}")
-                done_event.set()
-
-            wait_task = asyncio.create_task(wait_all())
-
-            while not done_event.is_set():
-                await asyncio.sleep(5)
-                if not self.running:
-                    wait_task.cancel()
-                    break
+        # При остановке — ждём завершения активных batch-задач
+        remaining = {bid: t for bid, t in batch_tasks.items() if not t.done()}
+        if remaining:
+            logger.info(f"⏳ Ожидание завершения {len(remaining)} активных пакетов...")
+            for batch_id, task in remaining.items():
+                try:
+                    await asyncio.wait_for(task, timeout=10.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
+                    logger.warning(f"Пакет {batch_id} не завершился при остановке: {e}")
+                    task.cancel()
 
         self._active_id = None
         self._active_progress = ""
         self.running = False
-        logger.info("✅ Очередь завершена")
+        logger.info("✅ Цикл очереди завершён")
 
     # ─────────────────────── Publish helpers ───────────────────────
 
@@ -695,10 +689,15 @@ class QueueManager:
 
                 try:
                     # Нормализуем формат данных поста
+                    # post_data может быть: [(mtype, fid), ...] или [mtype, fid]
                     if post_data and isinstance(post_data[0], (list, tuple)):
-                        media_to_process = [(m[0], m[1]) for m in post_data]
+                        media_to_process = [(str(m[0]), str(m[1])) for m in post_data]
+                    elif post_data and isinstance(post_data[0], str):
+                        # Плоский формат [mtype, fid] — один файл
+                        media_to_process = [(str(post_data[0]), str(post_data[1]))]
                     else:
-                        media_to_process = [(post_data[0], post_data[1])]
+                        logger.warning(f"❌ '{batch_name}' пост {i+1}: неизвестный формат данных {type(post_data)}")
+                        continue
 
                     processed = await media_processor.process_batch(media_to_process)
                     if not processed:
@@ -739,14 +738,14 @@ class QueueManager:
                     continue  # Продолжаем со следующим постом
 
         except asyncio.CancelledError:
-            logger.warning(f"Пакет '{batch_name}' отменён (running=False)")
+            logger.warning(f"Пакет '{batch_name}' отменён")
             # НЕ удаляем из running_batches.json — при следующем старте возобновим
             return
         except Exception as e:
             logger.error(f"Критическая ошибка пакета '{batch_name}': {e}")
-        finally:
-            # Удаляем из активных только если пакет реально завершён (не отменён)
-            pass
+            # Удаляем из активных, т.к. пакет не может продолжить работу
+            self._remove_running_batch(batch_id)
+            return
 
         # ✅ Удаляем из активных только после полного завершения
         self._remove_running_batch(batch_id)
