@@ -110,31 +110,60 @@ def hashtags_keyboard(
     user_id: int,
     cat_key: str,
     show_templates: bool = False,
+    delete_mode: bool = False,
 ) -> InlineKeyboardMarkup:
     rows = []
 
-    row = []
-    for tag in all_hashtags:
-        check = "✅ " if tag in selected else ""
-        row.append(InlineKeyboardButton(text=f"{check}{tag}", callback_data=f"tag:{tag}"))
-        if len(row) == 3:
+    if delete_mode:
+        # Режим удаления — показываем кастомные хештеги с кнопкой 🗑️
+        config = load_config()
+        default_tags = set()
+        for p in config.get("participants", {}).values():
+            cats = p.get("categories", {})
+            if cat_key in cats:
+                # Стандартные хештеги — те что в оригинальном config (для отображения)
+                pass
+        # Показываем все хештеги с кнопкой удаления
+        row = []
+        for tag in all_hashtags:
+            row.append(InlineKeyboardButton(
+                text=f"🗑️ {tag}",
+                callback_data=f"tag:del:{tag}"
+            ))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
             rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+        rows.append([
+            InlineKeyboardButton(text="🔙 Назад", callback_data="tag:delete_mode_off"),
+        ])
+    else:
+        row = []
+        for tag in all_hashtags:
+            check = "✅ " if tag in selected else ""
+            row.append(InlineKeyboardButton(text=f"{check}{tag}", callback_data=f"tag:{tag}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
 
-    rows.append([
-        InlineKeyboardButton(text="✅ Все", callback_data="tag:select_all"),
-        InlineKeyboardButton(text="❌ Сброс", callback_data="tag:clear_all"),
-    ])
-    rows.append([
-        InlineKeyboardButton(text="➕ Свой хештег", callback_data="tag:add_custom"),
-        InlineKeyboardButton(text="💾 Сохранить шаблон", callback_data="tag:save_template"),
-    ])
-    rows.append([
-        InlineKeyboardButton(text="📋 Мои шаблоны", callback_data="tag:templates"),
-        InlineKeyboardButton(text="✔️ Готово", callback_data="tag:done"),
-    ])
+        rows.append([
+            InlineKeyboardButton(text="✅ Все", callback_data="tag:select_all"),
+            InlineKeyboardButton(text="❌ Сброс", callback_data="tag:clear_all"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="➕ Свой хештег", callback_data="tag:add_custom"),
+            InlineKeyboardButton(text="🗑️ Удалить хештег", callback_data="tag:delete_mode_on"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="💾 Сохранить шаблон", callback_data="tag:save_template"),
+            InlineKeyboardButton(text="📋 Мои шаблоны", callback_data="tag:templates"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="✔️ Готово", callback_data="tag:done"),
+        ])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
