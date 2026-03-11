@@ -808,18 +808,24 @@ async def hashtag_selection(callback: CallbackQuery, state: FSMContext):
         selected = all_hashtags.copy()
         await state.update_data(selected_hashtags=selected)
         await callback.answer("✅ Все выбраны")
-        await callback.message.edit_reply_markup(
-            reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key)
-        )
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key)
+            )
+        except Exception:
+            pass
         return
 
     if action == "clear_all":
         selected = []
         await state.update_data(selected_hashtags=selected)
         await callback.answer("❌ Сброшено")
-        await callback.message.edit_reply_markup(
-            reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key)
-        )
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key)
+            )
+        except Exception:
+            pass
         return
 
     if action == "templates":
@@ -1012,9 +1018,12 @@ async def hashtag_selection(callback: CallbackQuery, state: FSMContext):
             selected.append(action)
 
         await state.update_data(selected_hashtags=selected)
-        await callback.message.edit_reply_markup(
-            reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key)
-        )
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=hashtags_keyboard(all_hashtags, selected, callback.from_user.id, cat_key)
+            )
+        except Exception:
+            pass
         return
 
 
@@ -1052,9 +1061,12 @@ async def apply_hashtag_template(callback: CallbackQuery, state: FSMContext):
             await callback.answer(f"✅ Шаблон \"{template_name}\" применен")
 
         await state.update_data(selected_hashtags=selected)
-        await callback.message.edit_reply_markup(
-            reply_markup=hashtag_templates_keyboard(callback.from_user.id, cat_key, selected)
-        )
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=hashtag_templates_keyboard(callback.from_user.id, cat_key, selected)
+            )
+        except Exception:
+            pass
         return
 
 
@@ -1507,7 +1519,10 @@ async def custom_schedule_date_action(callback: CallbackQuery, state: FSMContext
         await callback.answer()
         fresh_data = await state.get_data()
         days_ahead = fresh_data.get('days_ahead', 14)
-        await callback.message.edit_reply_markup(reply_markup=date_selection_keyboard(selected_dates, days_ahead=days_ahead))
+        try:
+            await callback.message.edit_reply_markup(reply_markup=date_selection_keyboard(selected_dates, days_ahead=days_ahead))
+        except Exception:
+            pass
         return
 
     elif action == "range":
@@ -1531,7 +1546,10 @@ async def custom_schedule_date_action(callback: CallbackQuery, state: FSMContext
         selected_dates = [(now + timedelta(days=i)).strftime("%d.%m") for i in range(days_ahead)]
         await state.update_data(selected_dates=selected_dates)
         await callback.answer(f"✅ Выбрано {len(selected_dates)} дней")
-        await callback.message.edit_reply_markup(reply_markup=date_selection_keyboard(selected_dates, days_ahead=days_ahead))
+        try:
+            await callback.message.edit_reply_markup(reply_markup=date_selection_keyboard(selected_dates, days_ahead=days_ahead))
+        except Exception:
+            pass
         return
 
     elif action == "clear":
@@ -1539,7 +1557,10 @@ async def custom_schedule_date_action(callback: CallbackQuery, state: FSMContext
         fresh_data = await state.get_data()
         days_ahead = fresh_data.get('days_ahead', 14)
         await state.update_data(selected_dates=selected_dates)
-        await callback.message.edit_reply_markup(reply_markup=date_selection_keyboard(selected_dates, days_ahead=days_ahead))
+        try:
+            await callback.message.edit_reply_markup(reply_markup=date_selection_keyboard(selected_dates, days_ahead=days_ahead))
+        except Exception:
+            pass
         await callback.answer("❌ Выбор очищен")
         return
 
@@ -1661,7 +1682,10 @@ async def custom_schedule_time_slot_action(callback: CallbackQuery, state: FSMCo
         selected_times = presets[preset_index] if preset_index < len(presets) else []
         await state.update_data(selected_times=selected_times)
         await callback.answer(f"✅ {', '.join(selected_times)}")
-        await callback.message.edit_reply_markup(reply_markup=time_slots_keyboard(posts_per_day, selected_times))
+        try:
+            await callback.message.edit_reply_markup(reply_markup=time_slots_keyboard(posts_per_day, selected_times))
+        except Exception:
+            pass
         return
 
     elif action == "custom":
