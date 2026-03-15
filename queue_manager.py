@@ -808,15 +808,22 @@ class QueueManager:
                         self._running_batch_items[batch_id]["published_count"] = i + 1
                         self._running_batch_items[batch_id].setdefault("published_log", []).append(published_at)
                         # Обновляем media_list — убираем уже опубликованные файлы
-                        # чтобы превью на сайте всегда показывало СЛЕДУЮЩИЙ пост
                         fpp = self._running_batch_items[batch_id].get("files_per_post", 1)
                         ml  = self._running_batch_items[batch_id].get("media_list", [])
-                        # Помечаем первые fpp записей как опубликованные
                         for _fi in range(min(fpp, len(ml))):
                             if not ml[_fi].get("published"):
                                 ml[_fi]["published"] = True
                                 break
                         self._save_running_batches()  # ✅ НА ДИСК!
+
+                    # Уведомляем сайт о публикации — счётчик постов обновится автоматически
+                    try:
+                        from keep_alive import notify_site_post_published
+                        asyncio.create_task(
+                            notify_site_post_published(user_id=item.get("user_id", 0), count=1)
+                        )
+                    except Exception:
+                        pass
 
                     logger.info(f"✅ '{batch_name}': {i+1}/{total}")
 
