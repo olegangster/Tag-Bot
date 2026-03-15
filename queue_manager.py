@@ -61,9 +61,6 @@ def _str_to_dt(s) -> datetime:
 
 class QueueManager:
     def __init__(self, filepath: str = "queue.json"):
-        # ✅ ИСПРАВЛЕНО: На Render сохраняем в .render/ — эта папка
-        # КЕШИРУЕТСЯ между деплоями (там же ffmpeg), файлы не теряются!
-        # Локально — сохраняем рядом с кодом как обычно.
         render_cache = Path("/opt/render/project/.render")
         if render_cache.exists():
             data_dir = render_cache / "botdata"
@@ -73,6 +70,11 @@ class QueueManager:
         else:
             self.filepath = Path(filepath)
             self.running_filepath = Path("running_batches.json")
+
+        # Папка для превью — файлы копируются сюда при добавлении пакета
+        # и НЕ удаляются после публикации, живут пока пакет активен
+        self.previews_dir = self.filepath.parent / "previews"
+        self.previews_dir.mkdir(exist_ok=True)
 
         self._queue: List[Dict] = self._load_queue()
         self.running: bool = False
@@ -160,6 +162,14 @@ class QueueManager:
         if batch_id in self._running_batch_items:
             del self._running_batch_items[batch_id]
         self._save_running_batches()
+        # Удаляем папку с превью — пакет завершён, файлы больше не нужны
+        try:
+            import shutil
+            preview_batch_dir = self.previews_dir / batch_id
+            if preview_batch_dir.exists():
+                shutil.rmtree(preview_batch_dir)
+        except Exception as e:
+            logger.warning(f"Не удалось удалить превью пакета {batch_id}: {e}")
         logger.info(f"✅ Пакет {batch_id} завершён и удалён из активных")
 
     # Алиас для обратной совместимости
@@ -190,6 +200,46 @@ class QueueManager:
                            selected_dates=None, selected_times=None,
                            is_comic=False, comic_link="", comic_title="", **kwargs) -> str:
         batch_id = str(uuid.uuid4())[:8]
+
+        # ── Копируем превью файлов в постоянную папку ──────────────────────────
+        # Файлы из Telegram удаляются после публикации — копируем сразу,
+        # чтобы сайт мог показывать реальные фотки из очереди.
+        preview_map = {}  # оригинальный путь -> путь в previews/
+        try:
+            import shutil
+            batch_preview_dir = self.previews_dir / batch_id
+            batch_preview_dir.mkdir(exist_ok=True)
+            for post_idx, post in enumerate(posts):
+                for file_idx, entry in enumerate(post if isinstance(post, (list, tuple)) else []):
+                    if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                        continue
+                    media_type, src_path = entry[0], Path(str(entry[1]))
+                    if not src_path.exists():
+                        continue
+                    # Сохраняем расширение чтобы браузер знал тип файла
+                    ext = src_path.suffix.lower() or ('.mp4' if media_type == 'video' else '.jpg')
+                    dst_name = f"p{post_idx:04d}_f{file_idx:02d}{ext}"
+                    dst_path = batch_preview_dir / dst_name
+                    shutil.copy2(src_path, dst_path)
+                    preview_map[str(src_path)] = str(dst_path)
+        except Exception as e:
+            logger.warning(f"Не удалось скопировать превью для пакета {batch_id}: {e}")
+
+        # Строим preview_files — список всех файлов в порядке постов
+        preview_files = []
+        for post in posts:
+            for entry in (post if isinstance(post, (list, tuple)) else []):
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                media_type, src_path = entry[0], str(entry[1])
+                preview_path = preview_map.get(src_path, "")
+                preview_files.append({
+                    "type": media_type,
+                    "path": preview_path,          # путь в previews/ (постоянный)
+                    "original": src_path,           # оригинал (может быть удалён)
+                    "published": False,
+                })
+
         self._queue.append({
             "id": batch_id, "type": "batch", "user_id": user_id,
             "name": name, "category_key": category_key,
@@ -204,6 +254,9 @@ class QueueManager:
             "is_comic": is_comic,
             "comic_link": comic_link,
             "comic_title": comic_title,
+            "preview_files": preview_files,
+            "files_per_post": len(posts[0]) if posts else 1,
+            "total_posts_count": len(posts),
         })
         self._save_queue()
         return batch_id
