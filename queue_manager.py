@@ -506,12 +506,24 @@ class QueueManager:
                     logger.info(f"🚀 Запуск пакета '{item.get('name')}' параллельно")
 
                     # ✅ Сохраняем в _running_batch_items И на диск ДО удаления из очереди
+                    # Извлекаем пути к файлам для превью на сайте
+                    _raw_posts = item.get("posts", [])
+                    _media_list = []
+                    for _post in _raw_posts:
+                        for _entry in (_post if isinstance(_post, (list, tuple)) else []):
+                            if isinstance(_entry, (list, tuple)) and len(_entry) >= 2:
+                                _mtype, _fpath = _entry[0], _entry[1]
+                                _media_list.append({"type": _mtype, "path": str(_fpath)})
+
                     running_item = {
                         **{k: v for k, v in item.items() if k != "schedule"},
                         "schedule": list(item.get("schedule", [])),
                         "_is_running": True,
                         "published_count": item.get("published_count", 0),
                         "published_log": item.get("published_log", []),
+                        "media_list": _media_list,
+                        "files_per_post": len(_raw_posts[0]) if _raw_posts else 1,
+                        "total_posts_count": len(_raw_posts),
                     }
                     self._running_batch_items[item["id"]] = running_item
                     self._save_running_batches()  # ✅ Сохраняем на диск
@@ -742,6 +754,15 @@ class QueueManager:
                     if batch_id in self._running_batch_items:
                         self._running_batch_items[batch_id]["published_count"] = i + 1
                         self._running_batch_items[batch_id].setdefault("published_log", []).append(published_at)
+                        # Обновляем media_list — убираем уже опубликованные файлы
+                        # чтобы превью на сайте всегда показывало СЛЕДУЮЩИЙ пост
+                        fpp = self._running_batch_items[batch_id].get("files_per_post", 1)
+                        ml  = self._running_batch_items[batch_id].get("media_list", [])
+                        # Помечаем первые fpp записей как опубликованные
+                        for _fi in range(min(fpp, len(ml))):
+                            if not ml[_fi].get("published"):
+                                ml[_fi]["published"] = True
+                                break
                         self._save_running_batches()  # ✅ НА ДИСК!
 
                     logger.info(f"✅ '{batch_name}': {i+1}/{total}")
