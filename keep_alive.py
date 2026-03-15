@@ -63,23 +63,24 @@ def _check_auth(request):
     return key == BOT_API_KEY
 
 def _extract_preview_files(batch, max_posts=4):
+    """
+    Берёт пути к файлам СЛЕДУЮЩИХ постов из media_list.
+    Формат media_list: [{"type": "photo"|"video", "path": "/abs/path", "published": True/False}, ...]
+    """
     media_list = batch.get("media_list", [])
     fpp  = batch.get("files_per_post", 1)
     done = batch.get("published_count", 0)
+
     result = []
-    start = done * fpp
-    end   = min(len(media_list), start + fpp * max_posts)
-    for item in media_list[start:end]:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            media_type, file_path = item[0], item[1]
-        elif isinstance(item, dict):
-            media_type = item.get("type", "photo")
-            file_path  = item.get("path", "")
-        else:
-            continue
-        path = Path(str(file_path))
-        if path.exists():
-            result.append({"path": str(path), "type": media_type})
+    # Пропускаем опубликованные (первые done*fpp записей)
+    skip = done * fpp
+    remaining = [m for m in media_list[skip:] if not m.get("published")]
+
+    for item in remaining[:fpp * max_posts]:
+        path = Path(str(item.get("path", "")))
+        if path.exists() and path.is_file():
+            result.append({"path": str(path), "type": item.get("type", "photo")})
+
     return result
 
 async def health(request):
