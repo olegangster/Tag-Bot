@@ -13,7 +13,64 @@ from aiohttp import web
 logger = logging.getLogger(__name__)
 
 BOT_API_KEY = os.environ.get("BOT_API_KEY", "300610")
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")  # нужен для Telegram file proxy
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+
+# 🔧 URL сайта на Fly.io — чтобы бот мог отправлять посты в трекер
+# Укажи свой URL: https://tg-sender-myname.fly.dev  (без слеша в конце)
+SITE_URL = os.environ.get("SITE_URL", "")
+
+# Маппинг Telegram user_id → имя участника
+# Читается из config.json автоматически при старте
+_PARTICIPANT_MAP: dict = {}  # {user_id_str: name}
+
+def _load_participant_map():
+    """Загружает маппинг участников из config.json."""
+    global _PARTICIPANT_MAP
+    try:
+        for base in _SEARCH_DIRS:
+            cfg_path = base / "config.json"
+            if cfg_path.exists():
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                for key, p in cfg.get("participants", {}).items():
+                    uid = str(p.get("user_id", ""))
+                    name = p.get("name", "")
+                    if uid and name:
+                        _PARTICIPANT_MAP[uid] = name
+                logger.info(f"Участники загружены: {_PARTICIPANT_MAP}")
+                return
+    except Exception as e:
+        logger.warning(f"Не удалось загрузить участников: {e}")
+
+async def notify_site_post_published(user_id: int, count: int = 1):
+    """
+    Вызывается после публикации поста — уведомляет сайт (backend.py на Fly)
+    чтобы тот обновил счётчик постов в трекере.
+    """
+    if not SITE_URL:
+        return  # SITE_URL не настроен — пропускаем тихо
+
+    participant_name = _PARTICIPANT_MAP.get(str(user_id), "")
+    if not participant_name:
+        logger.debug(f"notify_post: user_id {user_id} не найден в маппинге")
+        return
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = SITE_URL.rstrip("/") + "/api/tracker/bot_post"
+            await session.post(
+                url,
+                json={
+                    "participant_name": participant_name,
+                    "count": count,
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                },
+                headers={"X-Bot-Key": BOT_API_KEY},
+                timeout=aiohttp.ClientTimeout(total=5),
+            )
+            logger.info(f"[notify_post] {participant_name} +{count}")
+    except Exception as e:
+        logger.debug(f"notify_post error: {e}")  # не блокируем публикацию
 
 _SEARCH_DIRS = [
     Path("/opt/render/project/.render/botdata"),
@@ -236,6 +293,7 @@ async def api_file(request):
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
 async def start_keep_alive_server():
+    _load_participant_map()  # загружаем участников из config.json
     app = web.Application(client_max_size=50 * 1024 * 1024)
     app.router.add_get("/",                  health)
     app.router.add_get("/health",            health)
