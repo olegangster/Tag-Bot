@@ -64,22 +64,27 @@ def _check_auth(request):
 
 def _extract_preview_files(batch, max_posts=4):
     """
-    Берёт пути к файлам СЛЕДУЮЩИХ постов из media_list.
-    Формат media_list: [{"type": "photo"|"video", "path": "/abs/path", "published": True/False}, ...]
+    Берёт пути к превью следующих постов.
+    queue_manager заранее копирует файлы в previews/ при добавлении пакета.
     """
-    media_list = batch.get("media_list", [])
+    preview_files = batch.get("preview_files", [])
     fpp  = batch.get("files_per_post", 1)
     done = batch.get("published_count", 0)
 
-    result = []
-    # Пропускаем опубликованные (первые done*fpp записей)
+    # Пропускаем уже опубликованные файлы
     skip = done * fpp
-    remaining = [m for m in media_list[skip:] if not m.get("published")]
+    upcoming = preview_files[skip : skip + fpp * max_posts]
 
-    for item in remaining[:fpp * max_posts]:
-        path = Path(str(item.get("path", "")))
-        if path.exists() and path.is_file():
-            result.append({"path": str(path), "type": item.get("type", "photo")})
+    result = []
+    for item in upcoming:
+        if item.get("published"):
+            continue
+        # Сначала пробуем постоянную копию в previews/
+        for path_key in ("path", "original"):
+            p = Path(str(item.get(path_key, "")))
+            if p.exists() and p.is_file():
+                result.append({"path": str(p), "type": item.get("type", "photo")})
+                break
 
     return result
 
@@ -141,7 +146,12 @@ async def api_file(request):
     if not file_path_str:
         return web.Response(status=400, text="missing path", headers=_cors())
     file_path = Path(file_path_str)
-    allowed_prefixes = ["/tmp", "/var/tmp", "/opt/render/project", "/home", str(Path.cwd())]
+    allowed_prefixes = [
+        "/tmp", "/var/tmp",
+        "/opt/render/project",
+        "/home",
+        str(Path.cwd()),
+    ]
     safe = any(str(file_path).startswith(p) for p in allowed_prefixes)
     if not safe or not file_path.exists() or not file_path.is_file():
         return web.Response(status=404, text="not found", headers=_cors())
