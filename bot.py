@@ -27,8 +27,6 @@ load_dotenv(".env.txt")
 async def _autostart_queue(bot: Bot):
     from media_processor import MediaProcessor
     media_proc = MediaProcessor(bot)
-    # ✅ Всегда запускаем цикл очереди — он будет ждать новых элементов в фоне.
-    # Это необходимо чтобы после перезапуска очередь сразу принимала новые пакеты.
     started = await queue_mgr.start_queue(media_proc, bot)
     has_pending = bool(queue_mgr.get_pending_queue())
     has_running = bool(queue_mgr._running_batch_items)
@@ -54,17 +52,38 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
+    # FIX: удаляем вебхук и ждём 2с чтобы Telegram освободил старый long-poll
+    # Это решает TelegramConflictError при перезапуске на Render
+    logger.info("Очистка старых сессий Telegram...")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await asyncio.sleep(2)
+        logger.info("Сессия очищена")
+    except Exception as e:
+        logger.warning(f"delete_webhook: {e}")
+
+    # FIX: запускаем keep_alive с try/except — краш keep_alive не убивает бота
+    if _has_keep_alive:
+        try:
+            asyncio.create_task(start_keep_alive_server())
+        except Exception as e:
+            logger.error(f"keep_alive не запустился: {e}")
+
+    await _autostart_queue(bot)
     logger.info("Бот запущен!")
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        if _has_keep_alive:
-            asyncio.create_task(start_keep_alive_server())
-        await _autostart_queue(bot)
         await dp.start_polling(bot)
-    except KeyboardInterrupt:
-        logger.info("Остановка")
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Остановка по сигналу")
+    except Exception as e:
+        logger.error(f"Polling упал: {e}")
     finally:
+        logger.info("Завершение...")
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
         await bot.session.close()
         logger.info("Бот остановлен")
 
