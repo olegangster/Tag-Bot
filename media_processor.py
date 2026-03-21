@@ -432,10 +432,17 @@ class MediaProcessor:
                 logger.warning(f"⚠️ Файл {i} вернул None")
                 continue
             mtype, path = r
-            if isinstance(mtype, str) and path is not None and Path(path).exists():
+            if not isinstance(mtype, str) or path is None:
+                logger.warning(f"⚠️ Файл {i}: некорректный результат {r}")
+                continue
+            path_str = str(path)
+            # __fileid__: маркер — пересланный файл, отправляется напрямую без скачивания
+            if path_str.startswith("__fileid__:"):
+                processed.append((mtype, path))
+            elif Path(path).exists():
                 processed.append((mtype, path))
             else:
-                logger.warning(f"⚠️ Файл {i}: некорректный результат {r}")
+                logger.warning(f"⚠️ Файл {i}: путь не существует {path}")
 
         logger.info(f"✅ Обработано {len(processed)}/{len(media_list)} файлов")
         return processed
