@@ -202,43 +202,10 @@ class QueueManager:
         batch_id = str(uuid.uuid4())[:8]
 
         # ── Копируем превью файлов в постоянную папку ──────────────────────────
-        # Файлы из Telegram удаляются после публикации — копируем сразу,
-        # чтобы сайт мог показывать реальные фотки из очереди.
-        preview_map = {}  # оригинальный путь -> путь в previews/
-        try:
-            import shutil
-            batch_preview_dir = self.previews_dir / batch_id
-            batch_preview_dir.mkdir(exist_ok=True)
-            for post_idx, post in enumerate(posts):
-                for file_idx, entry in enumerate(post if isinstance(post, (list, tuple)) else []):
-                    if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-                        continue
-                    media_type, src_path = entry[0], Path(str(entry[1]))
-                    if not src_path.exists():
-                        continue
-                    # Сохраняем расширение чтобы браузер знал тип файла
-                    ext = src_path.suffix.lower() or ('.mp4' if media_type == 'video' else '.jpg')
-                    dst_name = f"p{post_idx:04d}_f{file_idx:02d}{ext}"
-                    dst_path = batch_preview_dir / dst_name
-                    shutil.copy2(src_path, dst_path)
-                    preview_map[str(src_path)] = str(dst_path)
-        except Exception as e:
-            logger.warning(f"Не удалось скопировать превью для пакета {batch_id}: {e}")
-
-        # Строим preview_files — список всех файлов в порядке постов
+        # Посты содержат (media_type, file_id) — file_id это строка Telegram,
+        # а не путь к файлу на диске. Превью копировать не из чего, пропускаем.
+        preview_map = {}
         preview_files = []
-        for post in posts:
-            for entry in (post if isinstance(post, (list, tuple)) else []):
-                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-                    continue
-                media_type, src_path = entry[0], str(entry[1])
-                preview_path = preview_map.get(src_path, "")
-                preview_files.append({
-                    "type": media_type,
-                    "path": preview_path,          # путь в previews/ (постоянный)
-                    "original": src_path,           # оригинал (может быть удалён)
-                    "published": False,
-                })
 
         self._queue.append({
             "id": batch_id, "type": "batch", "user_id": user_id,
@@ -769,14 +736,21 @@ class QueueManager:
 
                 try:
                     # Нормализуем формат данных поста
-                    # post_data может быть: [(mtype, fid), ...] или [mtype, fid]
-                    if post_data and isinstance(post_data[0], (list, tuple)):
+                    # post_data это список: [(mtype, file_id), ...] или [(mtype, file_id)]
+                    # file_id — строка Telegram (не путь к файлу)
+                    if not post_data:
+                        logger.warning(f"❌ '{batch_name}' пост {i+1}: пустые данные")
+                        continue
+
+                    first = post_data[0]
+                    if isinstance(first, (list, tuple)) and len(first) >= 2:
+                        # Стандартный формат: [(mtype, file_id), ...]
                         media_to_process = [(str(m[0]), str(m[1])) for m in post_data]
-                    elif post_data and isinstance(post_data[0], str):
-                        # Плоский формат [mtype, fid] — один файл
+                    elif isinstance(first, str) and len(post_data) >= 2:
+                        # Плоский формат: [mtype, file_id]
                         media_to_process = [(str(post_data[0]), str(post_data[1]))]
                     else:
-                        logger.warning(f"❌ '{batch_name}' пост {i+1}: неизвестный формат данных {type(post_data)}")
+                        logger.warning(f"❌ '{batch_name}' пост {i+1}: неизвестный формат данных: {post_data!r}")
                         continue
 
                     processed = await media_processor.process_batch(media_to_process)
