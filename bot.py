@@ -18,7 +18,7 @@ try:
     _has_keep_alive = True
 except ImportError:
     _has_keep_alive = False
-    logger.warning("keep_alive.py не найден")
+    logger.warning("keep_alive.py не знайдено")
 
 load_dotenv()
 load_dotenv(".env.txt")
@@ -27,17 +27,23 @@ load_dotenv(".env.txt")
 async def _autostart_queue(bot: Bot):
     from media_processor import MediaProcessor
     media_proc = MediaProcessor(bot)
+
+    # ✅ НОВОЕ: подключаем Telegram-persistent storage
+    # Это загрузит актуальное состояние очереди из Telegram после деплоя
+    await queue_mgr.setup(bot)
+
     started = await queue_mgr.start_queue(media_proc, bot)
     has_pending = bool(queue_mgr.get_pending_queue())
     has_running = bool(queue_mgr._running_batch_items)
+
     if has_running:
         logger.info(
-            f"Авто-старт: {len(queue_mgr.get_pending_queue())} ожидающих + "
-            f"{len(queue_mgr._running_batch_items)} возобновляемых"
+            f"Авто-старт: {len(queue_mgr.get_pending_queue())} в очікуванні + "
+            f"{len(queue_mgr._running_batch_items)} возобновляются"
         )
         logger.info("Очередь авто-запущена и восстанавливает активные пакеты!")
     elif has_pending:
-        logger.info(f"Авто-старт: {len(queue_mgr.get_pending_queue())} ожидающих элементов")
+        logger.info(f"Авто-старт: {len(queue_mgr.get_pending_queue())} елементів в очікуванні")
     else:
         logger.info("Цикл очереди запущен в режиме ожидания (очередь пуста)")
 
@@ -45,47 +51,46 @@ async def _autostart_queue(bot: Bot):
 async def main():
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
-        logger.error("BOT_TOKEN не найден")
+        logger.error("BOT_TOKEN не знайдено")
         return
 
     bot = Bot(token=bot_token)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # FIX: удаляем вебхук и ждём 2с чтобы Telegram освободил старый long-poll
-    # Это решает TelegramConflictError при перезапуске на Render
-    logger.info("Очистка старых сессий Telegram...")
+    # Видаляємо вебхук і чекаємо 2с щоб Telegram звільнив старий long-poll
+    # Це вирішує TelegramConflictError при перезапуску на Render
+    logger.info("Очищення старих сесій Telegram...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await asyncio.sleep(2)
-        logger.info("Сессия очищена")
+        logger.info("Сесію очищено")
     except Exception as e:
         logger.warning(f"delete_webhook: {e}")
 
-    # FIX: запускаем keep_alive с try/except — краш keep_alive не убивает бота
     if _has_keep_alive:
         try:
             asyncio.create_task(start_keep_alive_server())
         except Exception as e:
-            logger.error(f"keep_alive не запустился: {e}")
+            logger.error(f"keep_alive не запустився: {e}")
 
     await _autostart_queue(bot)
-    logger.info("Бот запущен!")
+    logger.info("Бот запущено!")
 
     try:
         await dp.start_polling(bot)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Остановка по сигналу")
+        logger.info("Зупинка за сигналом")
     except Exception as e:
-        logger.error(f"Polling упал: {e}")
+        logger.error(f"Polling впав: {e}")
     finally:
-        logger.info("Завершение...")
+        logger.info("Завершення...")
         try:
             await bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
         await bot.session.close()
-        logger.info("Бот остановлен")
+        logger.info("Бот зупинено")
 
 
 if __name__ == "__main__":
