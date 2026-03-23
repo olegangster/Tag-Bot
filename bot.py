@@ -18,7 +18,7 @@ try:
     _has_keep_alive = True
 except ImportError:
     _has_keep_alive = False
-    logger.warning("keep_alive.py не знайдено")
+    logger.warning("keep_alive.py не найден")
 
 load_dotenv()
 load_dotenv(".env.txt")
@@ -38,12 +38,12 @@ async def _autostart_queue(bot: Bot):
 
     if has_running:
         logger.info(
-            f"Авто-старт: {len(queue_mgr.get_pending_queue())} в очікуванні + "
-            f"{len(queue_mgr._running_batch_items)} возобновляются"
+            f"Авто-старт: {len(queue_mgr.get_pending_queue())} в ожидании + "
+            f"{len(queue_mgr._running_batch_items)} восстанавливаются"
         )
         logger.info("Очередь авто-запущена и восстанавливает активные пакеты!")
     elif has_pending:
-        logger.info(f"Авто-старт: {len(queue_mgr.get_pending_queue())} елементів в очікуванні")
+        logger.info(f"Авто-старт: {len(queue_mgr.get_pending_queue())} элементов в ожидании")
     else:
         logger.info("Цикл очереди запущен в режиме ожидания (очередь пуста)")
 
@@ -51,20 +51,20 @@ async def _autostart_queue(bot: Bot):
 async def main():
     bot_token = os.getenv("BOT_TOKEN")
     if not bot_token:
-        logger.error("BOT_TOKEN не знайдено")
+        logger.error("BOT_TOKEN не найден")
         return
 
     bot = Bot(token=bot_token)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Видаляємо вебхук і чекаємо 2с щоб Telegram звільнив старий long-poll
-    # Це вирішує TelegramConflictError при перезапуску на Render
-    logger.info("Очищення старих сесій Telegram...")
+    # Удаляем вебхук и ждём 2с чтобы Telegram освободил старый long-poll
+    # Это решает TelegramConflictError при перезапуске на Render
+    logger.info("Очистка старых сессий Telegram...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await asyncio.sleep(2)
-        logger.info("Сесію очищено")
+        logger.info("Сессия очищена")
     except Exception as e:
         logger.warning(f"delete_webhook: {e}")
 
@@ -72,25 +72,25 @@ async def main():
         try:
             asyncio.create_task(start_keep_alive_server())
         except Exception as e:
-            logger.error(f"keep_alive не запустився: {e}")
+            logger.error(f"keep_alive не запустился: {e}")
 
     await _autostart_queue(bot)
-    logger.info("Бот запущено!")
+    logger.info("Бот запущен!")
 
     try:
         await dp.start_polling(bot)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Зупинка за сигналом")
+        logger.info("Остановка по сигналу")
     except Exception as e:
-        logger.error(f"Polling впав: {e}")
+        logger.error(f"Polling упал: {e}")
     finally:
-        logger.info("Завершення...")
+        logger.info("Завершение...")
         try:
             await bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
         await bot.session.close()
-        logger.info("Бот зупинено")
+        logger.info("Бот остановлен")
 
 
 if __name__ == "__main__":
