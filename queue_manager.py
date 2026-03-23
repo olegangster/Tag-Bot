@@ -1,23 +1,28 @@
 """
-queue_manager.py — менеджер очереди публикаций
+queue_manager.py — менеджер черги публікацій
 
-✅ КРИТИЧЕСКИЕ ИСПРАВЛЕНИЯ v3:
+✅ v4 — НЕВБИВАНА ЧЕРГА:
 
-ПРОБЛЕМА (было): Когда пакет начинал публиковаться, он удалялся из queue.json
-и переходил в _running_batch_items (только в оперативной памяти).
-При перезапуске Render — память очищалась, все активные пакеты терялись навсегда.
+ПРОБЛЕМА v3: running_batches.json і queue.json зберігались у файловій
+системі Render.com, яка знищується при кожному деплої/перезапуску.
+Код відновлення працював, але файлів вже не було.
 
-РЕШЕНИЕ (стало):
-1. running_batches.json — отдельный файл для активно публикующихся пакетов.
-   Сохраняется на диск после КАЖДОГО опубликованного поста.
-2. При перезапуске бота — активные пакеты восстанавливаются из файла
-   и продолжают с места остановки (пропуская уже опубликованные посты).
-3. queue.json — для ожидающих пакетов (не тронуто).
-4. Все методы фильтруют данные по user_id — каждый видит только свою очередь.
+РІШЕННЯ v4:
+1. TelegramStateStorage — зберігає стан у Telegram повідомленнях.
+   Telegram — зовнішній сервіс, не залежить від файлової системи Render.
+2. При СТАРТІ — завантажуємо з Telegram (завжди актуально після деплою).
+3. При КОЖНОМУ ЗБЕРЕЖЕННІ — зберігаємо і в файл (кеш), і в Telegram.
+4. Якщо Telegram недоступний — fallback на локальний файл.
+5. Публічний API QueueManager не змінився — handlers.py не потребує змін.
+
+НАЛАШТУВАННЯ (додай у .env.txt або Render Environment Variables):
+    STORAGE_CHAT_ID=<твій_telegram_user_id>
+    # або залиш порожнім — тоді використається перший admin з ADMIN_IDS
 """
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -36,7 +41,6 @@ def load_config() -> dict:
 
 
 def _dt_to_str(dt) -> str:
-    """Конвертирует datetime в ISO строку для сохранения."""
     if isinstance(dt, datetime):
         if dt.tzinfo is None:
             dt = KYIV_TZ.localize(dt)
@@ -45,7 +49,6 @@ def _dt_to_str(dt) -> str:
 
 
 def _str_to_dt(s) -> datetime:
-    """Конвертирует ISO строку в timezone-aware datetime."""
     if isinstance(s, datetime):
         if s.tzinfo is None:
             return KYIV_TZ.localize(s)
@@ -59,8 +62,31 @@ def _str_to_dt(s) -> datetime:
         return datetime.now(KYIV_TZ)
 
 
+def _deserialize_schedule(data: list) -> list:
+    """Конвертує рядки ISO у datetime у всіх елементах списку."""
+    result = []
+    for item in data:
+        ic = dict(item)
+        if "schedule" in ic:
+            ic["schedule"] = [_str_to_dt(s) for s in ic["schedule"]]
+        result.append(ic)
+    return result
+
+
+def _deserialize_running(data: dict) -> dict:
+    """Конвертує рядки ISO у datetime у running_batches."""
+    result = {}
+    for batch_id, item in data.items():
+        ic = dict(item)
+        if "schedule" in ic:
+            ic["schedule"] = [_str_to_dt(s) for s in ic["schedule"]]
+        result[batch_id] = ic
+    return result
+
+
 class QueueManager:
     def __init__(self, filepath: str = "queue.json"):
+        # Локальний fallback-шлях
         render_cache = Path("/opt/render/project/.render")
         if render_cache.exists():
             data_dir = render_cache / "botdata"
@@ -71,42 +97,115 @@ class QueueManager:
             self.filepath = Path(filepath)
             self.running_filepath = Path("running_batches.json")
 
-        # Папка для превью — файлы копируются сюда при добавлении пакета
-        # и НЕ удаляются после публикации, живут пока пакет активен
         self.previews_dir = self.filepath.parent / "previews"
         self.previews_dir.mkdir(exist_ok=True)
 
-        self._queue: List[Dict] = self._load_queue()
+        # Telegram storage (ініціалізується асинхронно через setup())
+        self._tg_storage = None
+
+        # Стан у пам'яті
+        self._queue: List[Dict] = self._load_queue_sync()
         self.running: bool = False
         self.interval: int = 60
         self._task: Optional[asyncio.Task] = None
         self._active_id: Optional[str] = None
         self._active_progress: str = ""
-
-        # ✅ Активные пакеты теперь ЗАГРУЖАЮТСЯ с диска при старте
-        self._running_batch_items: Dict[str, Dict] = self._load_running_batches()
-
+        self._running_batch_items: Dict[str, Dict] = self._load_running_batches_sync()
         self.batch_service = None
 
-    # ─────────────────────── Persistence: queue.json ───────────────────────
+    # ─────────────────── Async setup (Telegram storage) ─────────────────────
 
-    def _load_queue(self) -> List[Dict]:
-        """Загружает ожидающую очередь из queue.json."""
+    async def setup(self, bot):
+        """
+        ✅ НОВИЙ МЕТОД: Підключає Telegram storage і підвантажує актуальний стан.
+        Викликати в bot.py після створення bot instance, до start_polling.
+        """
+        try:
+            from telegram_state_storage import init_storage, TelegramStateStorage
+
+            storage_chat_id = self._get_storage_chat_id()
+            if not storage_chat_id:
+                logger.warning(
+                    "⚠️ STORAGE_CHAT_ID не задано — черга зберігається тільки локально. "
+                    "Додай STORAGE_CHAT_ID у .env.txt або змінні Render для невбивної черги."
+                )
+                return
+
+            self._tg_storage = init_storage(bot, storage_chat_id)
+            await self._tg_storage.initialize()
+
+            # ✅ Завантажуємо актуальний стан з Telegram (завжди свіжий після деплою)
+            queue_data = await self._tg_storage.load_queue()
+            if queue_data is not None:
+                self._queue = _deserialize_schedule(queue_data)
+                logger.info(f"📥 Черга завантажена з Telegram: {len(self._queue)} елементів")
+
+            running_data = await self._tg_storage.load_running_batches()
+            if running_data is not None:
+                self._running_batch_items = _deserialize_running(running_data)
+                if self._running_batch_items:
+                    logger.info(
+                        f"🔄 Активні пакети відновлені з Telegram: "
+                        f"{len(self._running_batch_items)}"
+                    )
+
+        except ImportError:
+            logger.warning(
+                "telegram_state_storage.py не знайдено — "
+                "черга зберігається тільки локально."
+            )
+        except Exception as e:
+            logger.error(f"❌ setup() помилка: {e}")
+
+    def _get_storage_chat_id(self) -> Optional[int]:
+        """Повертає chat_id для зберігання стану."""
+        # Спочатку явно задане STORAGE_CHAT_ID
+        val = os.getenv("STORAGE_CHAT_ID", "").strip()
+        if val:
+            try:
+                return int(val)
+            except ValueError:
+                pass
+
+        # Fallback: перший admin з ADMIN_IDS
+        admin_ids = os.getenv("ADMIN_IDS", "").strip()
+        if admin_ids:
+            first = admin_ids.split(",")[0].strip()
+            try:
+                return int(first)
+            except ValueError:
+                pass
+
+        return None
+
+    # ─────────────────── Sync file I/O (local fallback) ─────────────────────
+
+    def _load_queue_sync(self) -> List[Dict]:
         if self.filepath.exists():
             try:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                for item in data:
-                    if "schedule" in item:
-                        item["schedule"] = [_str_to_dt(s) for s in item["schedule"]]
-                logger.info(f"📂 Загружено из queue.json: {len(data)} элементов")
-                return data
+                result = _deserialize_schedule(data)
+                logger.info(f"📂 queue.json (локально): {len(result)} елементів")
+                return result
             except Exception as e:
-                logger.error(f"Ошибка загрузки queue.json: {e}")
+                logger.error(f"Помилка читання queue.json: {e}")
         return []
 
-    def _save_queue(self):
-        """Сохраняет ожидающую очередь в queue.json."""
+    def _load_running_batches_sync(self) -> Dict[str, Dict]:
+        if self.running_filepath.exists():
+            try:
+                with open(self.running_filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                result = _deserialize_running(data)
+                if result:
+                    logger.info(f"🔄 running_batches.json (локально): {len(result)}")
+                return result
+            except Exception as e:
+                logger.error(f"Помилка читання running_batches.json: {e}")
+        return {}
+
+    def _save_queue_local(self):
         try:
             data = []
             for item in self._queue:
@@ -117,34 +216,9 @@ class QueueManager:
             with open(self.filepath, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"Ошибка сохранения queue.json: {e}")
+            logger.error(f"Помилка збереження queue.json: {e}")
 
-    # ─────────────────────── Persistence: running_batches.json ───────────────────────
-
-    def _load_running_batches(self) -> Dict[str, Dict]:
-        """
-        ✅ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Загружает активно публикующиеся пакеты с диска.
-        Вызывается при старте бота — восстанавливает состояние после перезапуска Render.
-        """
-        if self.running_filepath.exists():
-            try:
-                with open(self.running_filepath, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                for batch_id, item in data.items():
-                    if "schedule" in item:
-                        item["schedule"] = [_str_to_dt(s) for s in item["schedule"]]
-                if data:
-                    logger.info(f"🔄 Восстановлено {len(data)} активных пакетов из running_batches.json")
-                return data
-            except Exception as e:
-                logger.error(f"Ошибка загрузки running_batches.json: {e}")
-        return {}
-
-    def _save_running_batches(self):
-        """
-        ✅ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Сохраняет активные пакеты на диск.
-        Вызывается после каждого опубликованного поста и при старте пакета.
-        """
+    def _save_running_local(self):
         try:
             data = {}
             for batch_id, item in self._running_batch_items.items():
@@ -155,28 +229,66 @@ class QueueManager:
             with open(self.running_filepath, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"Ошибка сохранения running_batches.json: {e}")
+            logger.error(f"Помилка збереження running_batches.json: {e}")
+
+    # ─────────────────── Async save (Telegram + local) ──────────────────────
+
+    def _save_queue(self):
+        """Синхронне збереження локально + запускає async збереження в Telegram."""
+        self._save_queue_local()
+        if self._tg_storage:
+            asyncio.create_task(self._save_queue_to_tg())
+
+    def _save_running_batches(self):
+        """Синхронне збереження локально + запускає async збереження в Telegram."""
+        self._save_running_local()
+        if self._tg_storage:
+            asyncio.create_task(self._save_running_to_tg())
+
+    async def _save_queue_to_tg(self):
+        """Зберігає чергу в Telegram (викликається як task)."""
+        try:
+            data = []
+            for item in self._queue:
+                ic = dict(item)
+                if "schedule" in ic:
+                    ic["schedule"] = [_dt_to_str(s) for s in ic["schedule"]]
+                data.append(ic)
+            await self._tg_storage.save_queue(data)
+        except Exception as e:
+            logger.warning(f"Помилка збереження черги в Telegram: {e}")
+
+    async def _save_running_to_tg(self):
+        """Зберігає running_batches в Telegram (викликається як task)."""
+        try:
+            data = {}
+            for batch_id, item in self._running_batch_items.items():
+                ic = dict(item)
+                if "schedule" in ic:
+                    ic["schedule"] = [_dt_to_str(s) for s in ic["schedule"]]
+                data[batch_id] = ic
+            await self._tg_storage.save_running_batches(data)
+        except Exception as e:
+            logger.warning(f"Помилка збереження running_batches в Telegram: {e}")
+
+    # Аліас для зворотної сумісності
+    def _save(self):
+        self._save_queue()
 
     def _remove_running_batch(self, batch_id: str):
-        """Удаляет завершённый пакет из активных и сохраняет на диск."""
         if batch_id in self._running_batch_items:
             del self._running_batch_items[batch_id]
         self._save_running_batches()
-        # Удаляем папку с превью — пакет завершён, файлы больше не нужны
         try:
             import shutil
             preview_batch_dir = self.previews_dir / batch_id
             if preview_batch_dir.exists():
                 shutil.rmtree(preview_batch_dir)
         except Exception as e:
-            logger.warning(f"Не удалось удалить превью пакета {batch_id}: {e}")
-        logger.info(f"✅ Пакет {batch_id} завершён и удалён из активных")
+            logger.warning(f"Не вдалось видалити превью пакету {batch_id}: {e}")
+        logger.info(f"✅ Пакет {batch_id} завершено і видалено з активних")
 
-    # Алиас для обратной совместимости
-    def _save(self):
-        self._save_queue()
-
-    # ─────────────────────── Add items ───────────────────────
+    # ─────────────────────── Add items ───────────────────────────────────────
 
     def add_to_queue(self, user_id, name, category_key, category_data, platform_id,
                      media_files, selected_hashtags, description="", topic=None,
@@ -200,11 +312,6 @@ class QueueManager:
                            selected_dates=None, selected_times=None,
                            is_comic=False, comic_link="", comic_title="", **kwargs) -> str:
         batch_id = str(uuid.uuid4())[:8]
-
-        # ── Копируем превью файлов в постоянную папку ──────────────────────────
-        # Посты содержат (media_type, file_id) — file_id это строка Telegram,
-        # а не путь к файлу на диске. Превью копировать не из чего, пропускаем.
-        preview_map = {}
         preview_files = []
 
         self._queue.append({
@@ -231,7 +338,6 @@ class QueueManager:
     def merge_batch_into_active(self, user_id, category_data, category_key, platform_id,
                                 posts, schedule, topic=None, name="Пакет",
                                 time_period="hour", time_value=1, stars_price=None) -> str:
-        # Если нет активного пакета — просто добавляем в очередь
         active_batches = [bid for bid, item in self._running_batch_items.items()
                           if item.get("user_id") == user_id]
         if not active_batches:
@@ -242,19 +348,17 @@ class QueueManager:
                 time_period=time_period, time_value=time_value,
                 stars_price=stars_price,
             )
-        # Добавляем посты в первый активный пакет пользователя
         batch_id = active_batches[0]
         item = self._running_batch_items[batch_id]
         item["posts"].extend(posts)
         item["schedule"].extend(schedule)
         self._save_running_batches()
-        logger.info(f"✅ Добавлено {len(posts)} постов в активный пакет {batch_id}")
+        logger.info(f"✅ Додано {len(posts)} постів в активний пакет {batch_id}")
         return batch_id
 
-    # ─────────────────────── Queue access ───────────────────────
+    # ─────────────────────── Queue access ────────────────────────────────────
 
     def get_queue(self, user_id: int = None) -> List[Dict]:
-        """Возвращает активные пакеты + ожидающие (опционально фильтр по user_id)."""
         result = []
         for batch_id, item in self._running_batch_items.items():
             if user_id is None or item.get("user_id") == user_id:
@@ -265,13 +369,11 @@ class QueueManager:
         return result
 
     def get_pending_queue(self, user_id: int = None) -> List[Dict]:
-        """Только ожидающие элементы."""
         if user_id is None:
             return list(self._queue)
         return [item for item in self._queue if item.get("user_id") == user_id]
 
     def get_pending_queue_indices(self, user_id: int) -> List[int]:
-        """Реальные индексы элементов пользователя в self._queue."""
         return [i for i, item in enumerate(self._queue) if item.get("user_id") == user_id]
 
     def get_running_batch_ids(self, user_id: int = None) -> set:
@@ -307,10 +409,9 @@ class QueueManager:
                 return item
         return None
 
-    # ─────────────────────── Mutate queue ───────────────────────
+    # ─────────────────────── Mutate queue ────────────────────────────────────
 
     def remove_from_queue(self, index: int, user_id: int = None) -> bool:
-        """Удаляет элемент очереди. index — позиция среди элементов ЭТОГО пользователя."""
         if user_id is not None:
             user_indices = self.get_pending_queue_indices(user_id)
             if index >= len(user_indices):
@@ -328,12 +429,11 @@ class QueueManager:
                 if item.get("id"):
                     self.batch_service.cancel_batch_tasks(item["id"])
             self._save_queue()
-            logger.info(f"Удалён из очереди: {item.get('name')}")
+            logger.info(f"Видалено з черги: {item.get('name')}")
             return True
         return False
 
     def clear_queue(self, user_id: int = None, skip_active: bool = True):
-        """Очищает очередь — только для указанного пользователя."""
         if user_id is not None:
             active_id = self._active_id if (skip_active and self.running) else None
             self._queue = [
@@ -345,12 +445,11 @@ class QueueManager:
         else:
             self._queue.clear()
         self._save_queue()
-        logger.info(f"🗑️ Очередь очищена (user_id={user_id})")
 
     def set_interval(self, minutes: int):
         self.interval = max(1, int(minutes))
 
-    # ─────────────────────── Status ───────────────────────
+    # ─────────────────────── Status ──────────────────────────────────────────
 
     def get_status(self, user_id: int = None) -> Dict:
         user_pending = self.get_pending_queue(user_id)
@@ -368,12 +467,14 @@ class QueueManager:
 
     def get_status_text(self, user_id: int = None) -> str:
         s = self.get_status(user_id)
-        icon = "🟢 Активна" if s["running"] else "🔴 Остановлена"
-        text = f"📥 <b>Очередь публикаций</b>\n\nСтатус: <b>{icon}</b>\n"
+        icon = "🟢 Активна" if s["running"] else "🔴 Зупинена"
+        # ✅ Показуємо статус persistence
+        tg_icon = "☁️" if self._tg_storage else "💾"
+        text = f"📥 <b>Черга публікацій</b> {tg_icon}\n\nСтатус: <b>{icon}</b>\n"
 
         running_batches = s.get("running_batches", {})
         if s["running"] and running_batches:
-            text += f"\n<b>▶️ Публикуется прямо сейчас ({len(running_batches)}):</b>\n"
+            text += f"\n<b>▶️ Публікується зараз ({len(running_batches)}):</b>\n"
             for batch_id, item in running_batches.items():
                 cat = item.get("category_data", {})
                 cat_name = f"{cat.get('emoji', '')} {cat.get('name', '—')}"
@@ -381,20 +482,23 @@ class QueueManager:
                 total = len(item.get("posts", []))
                 text += f"• {item.get('name', batch_id)} [{cat_name}]: <b>{published}/{total}</b>\n"
         elif s["running"] and s["active_progress"]:
-            text += f"▶️ Публикуется: <i>{s['active_progress']}</i>\n"
+            text += f"▶️ Публікується: <i>{s['active_progress']}</i>\n"
 
-        text += f"\n📋 Элементов в очереди: <b>{s['pending']}</b>\n"
-        text += f"⏱ Интервал: <b>{s['interval']} мин</b>\n"
+        text += f"\n📋 В черзі: <b>{s['pending']}</b>\n"
+        text += f"⏱ Інтервал: <b>{s['interval']} хв</b>\n"
+
+        if not self._tg_storage:
+            text += "\n⚠️ <i>Додай STORAGE_CHAT_ID для невбивної черги</i>"
 
         if running_batches:
-            text += "\n💡 Нажмите <b>📊 Прогресс</b> для деталей"
+            text += "\n\n💡 Натисни <b>📊 Прогрес</b> для деталей"
 
         return text
 
     def get_running_batch_detail_text(self, batch_id: str) -> str:
         item = self._running_batch_items.get(batch_id)
         if not item:
-            return "⚠️ Пакет уже завершён или не найден"
+            return "⚠️ Пакет вже завершено або не знайдено"
 
         cat = item.get("category_data", {})
         cat_name = f"{cat.get('emoji', '')} {cat.get('name', '—')}"
@@ -404,11 +508,11 @@ class QueueManager:
         total = len(item.get("posts", []))
 
         text = f"📦 <b>{item.get('name', batch_id)}</b>\n"
-        text += f"📁 Категория: {cat_name}\n"
-        text += f"📊 Прогресс: <b>{published_count}/{total}</b>\n\n"
+        text += f"📁 Категорія: {cat_name}\n"
+        text += f"📊 Прогрес: <b>{published_count}/{total}</b>\n\n"
 
         if published_log:
-            text += "✅ <b>Уже опубликовано:</b>\n"
+            text += "✅ <b>Вже опубліковано:</b>\n"
             for ts in published_log[-10:]:
                 try:
                     dt = _str_to_dt(ts)
@@ -420,7 +524,7 @@ class QueueManager:
 
         remaining_schedule = schedule[published_count:]
         if remaining_schedule:
-            text += "⏳ <b>Предстоит:</b>\n"
+            text += "⏳ <b>Заплановано:</b>\n"
             for s in remaining_schedule[:10]:
                 try:
                     dt = _str_to_dt(s)
@@ -429,7 +533,7 @@ class QueueManager:
                 except Exception:
                     text += f"  • {s}\n"
             if len(remaining_schedule) > 10:
-                text += f"  ... и ещё {len(remaining_schedule) - 10}\n"
+                text += f"  ... і ще {len(remaining_schedule) - 10}\n"
 
         return text
 
@@ -439,23 +543,16 @@ class QueueManager:
             if user_id is None or item.get("user_id") == user_id
         }
         if not items:
-            return "▶️ Нет активно публикующихся пакетов"
+            return "▶️ Немає активних пакетів"
         text = ""
         for batch_id in items:
             text += self.get_running_batch_detail_text(batch_id)
             text += "\n" + "─" * 25 + "\n\n"
         return text.rstrip()
 
-    # ─────────────────────── Queue control ───────────────────────
+    # ─────────────────────── Queue control ───────────────────────────────────
 
     async def start_queue(self, media_processor, bot) -> bool:
-        """
-        ✅ ИСПРАВЛЕНО: запускает очередь.
-        - Перезапускает цикл, если предыдущий завершился (даже при running=True).
-        - Запускает восстановленные активные пакеты из running_batches.json.
-        - Всегда принимает новые элементы даже когда очередь была пуста.
-        """
-        # Если цикл жив — не запускаем повторно
         if self._task and not self._task.done():
             self.running = True
             return True
@@ -464,8 +561,10 @@ class QueueManager:
         self.batch_service = BatchPostingService(media_processor, bot)
 
         self.running = True
-        self._task = asyncio.create_task(self._process_queue_loop(media_processor, bot))
-        logger.info("▶️ Очередь запущена")
+        self._task = asyncio.create_task(
+            self._process_queue_loop(media_processor, bot)
+        )
+        logger.info("▶️ Черга запущена")
         return True
 
     async def stop_queue(self):
@@ -478,29 +577,20 @@ class QueueManager:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info("⏹ Очередь остановлена")
+        logger.info("⏹ Черга зупинена")
 
-    # ─────────────────────── Queue loop ───────────────────────
+    # ─────────────────────── Queue loop ──────────────────────────────────────
 
     async def _process_queue_loop(self, media_processor, bot):
-        """
-        Главный цикл очереди.
-        ✅ ИСПРАВЛЕНО:
-        - Цикл НЕ завершается когда очередь пуста — ждёт новых элементов.
-        - Завершается только при явном stop_queue() или CancelledError.
-        - Восстанавливает прерванные пакеты из running_batches.json при старте.
-        - Корректная отслеживание batch-задач по ID.
-        """
-        logger.info("▶️ Цикл очереди запущен")
-        batch_tasks: dict = {}  # batch_id -> asyncio.Task
+        logger.info("▶️ Цикл черги запущено")
+        batch_tasks: dict = {}
 
-        # ✅ ВОССТАНОВЛЕНИЕ: Если после перезапуска есть активные пакеты —
-        # запускаем их сразу, пропуская уже опубликованные посты
+        # Відновлення перерваних пакетів після рестарту
         for batch_id, item in list(self._running_batch_items.items()):
             if batch_id not in batch_tasks:
                 logger.info(
-                    f"🔄 Возобновляем пакет '{item.get('name')}' "
-                    f"(опубликовано: {item.get('published_count', 0)}/{len(item.get('posts', []))})"
+                    f"🔄 Відновлюємо пакет '{item.get('name')}' "
+                    f"(опубліковано: {item.get('published_count', 0)}/{len(item.get('posts', []))})"
                 )
                 task = asyncio.create_task(
                     self._publish_batch(batch_id, item, media_processor, bot)
@@ -508,12 +598,10 @@ class QueueManager:
                 batch_tasks[batch_id] = task
 
         while self.running:
-            # Убираем завершённые задачи из словаря
             for bid in list(batch_tasks.keys()):
                 if batch_tasks[bid].done():
                     del batch_tasks[bid]
 
-            # Очередь пуста — ждём новых элементов (НЕ выходим из цикла!)
             if not self._queue:
                 await asyncio.sleep(2)
                 continue
@@ -523,10 +611,8 @@ class QueueManager:
 
             try:
                 if item["type"] == "batch":
-                    logger.info(f"🚀 Запуск пакета '{item.get('name')}' параллельно")
+                    logger.info(f"🚀 Запуск пакету '{item.get('name')}'")
 
-                    # ✅ Сохраняем в _running_batch_items И на диск ДО удаления из очереди
-                    # Извлекаем пути к файлам для превью на сайте
                     _raw_posts = item.get("posts", [])
                     _media_list = []
                     for _post in _raw_posts:
@@ -546,7 +632,7 @@ class QueueManager:
                         "total_posts_count": len(_raw_posts),
                     }
                     self._running_batch_items[item["id"]] = running_item
-                    self._save_running_batches()  # ✅ Сохраняем на диск
+                    self._save_running_batches()  # ✅ Зберігаємо до видалення з черги
 
                     task = asyncio.create_task(
                         self._publish_batch(item["id"], running_item, media_processor, bot)
@@ -569,7 +655,7 @@ class QueueManager:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Ошибка публикации: {e}")
+                logger.error(f"Помилка публікації: {e}")
                 if self._queue and self._queue[0].get("id") == item.get("id"):
                     self._queue.pop(0)
                     self._save_queue()
@@ -577,30 +663,27 @@ class QueueManager:
             self._active_id = None
             self._active_progress = ""
 
-            # Пауза между одиночными постами (только если есть ещё элементы в очереди)
             if self._queue and self.running:
                 await asyncio.sleep(self.interval * 60)
 
-        # При остановке — ждём завершения активных batch-задач
         remaining = {bid: t for bid, t in batch_tasks.items() if not t.done()}
         if remaining:
-            logger.info(f"⏳ Ожидание завершения {len(remaining)} активных пакетов...")
+            logger.info(f"⏳ Очікування завершення {len(remaining)} активних пакетів...")
             for batch_id, task in remaining.items():
                 try:
                     await asyncio.wait_for(task, timeout=10.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
-                    logger.warning(f"Пакет {batch_id} не завершился при остановке: {e}")
+                    logger.warning(f"Пакет {batch_id} не завершився: {e}")
                     task.cancel()
 
         self._active_id = None
         self._active_progress = ""
         self.running = False
-        logger.info("✅ Цикл очереди завершён")
+        logger.info("✅ Цикл черги завершено")
 
-    # ─────────────────────── Publish helpers ───────────────────────
+    # ─────────────────────── Publish helpers ─────────────────────────────────
 
     async def _publish_single(self, item: Dict, media_processor, bot):
-        """Публикует одиночный пост из очереди."""
         category_data = item["category_data"]
         platform_id = item["platform_id"]
         topic = item.get("topic")
@@ -623,9 +706,9 @@ class QueueManager:
                 f"{category_data.get('emoji_row', '')}\n\n"
             )
             if platform_type == "channel":
-                caption += f"Получить бесплатно доступ к приватке ➡️ {referral_bot}\n"
+                caption += f"Отримати безкоштовний доступ до привату ➡️ {referral_bot}\n"
             caption += f"↘️⬇️↙️\n"
-            caption += f'<a href="{invite_link}">Ссылка для друга</a>'
+            caption += f'<a href="{invite_link}">Посилання для друга</a>'
             kwargs = dict(chat_id=chat_id, text=caption, parse_mode="HTML")
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
@@ -637,7 +720,9 @@ class QueueManager:
             processed = await media_processor.process_batch(media_to_process)
             if not processed:
                 return
-            caption = self._format_caption(category_data, item.get("selected_hashtags", []), platform_id)
+            caption = self._format_caption(
+                category_data, item.get("selected_hashtags", []), platform_id
+            )
             if len(processed) == 1:
                 await media_processor.send_single_media(
                     chat_id, processed[0][0], processed[0][1], caption, thread_id
@@ -647,15 +732,9 @@ class QueueManager:
                     chat_id, processed, caption, thread_id
                 )
             media_processor.cleanup_specific([p for _, p in processed])
-        logger.info(f"✅ '{item.get('name')}' опубликован")
+        logger.info(f"✅ '{item.get('name')}' опубліковано")
 
     async def _publish_batch(self, batch_id: str, item: Dict, media_processor, bot):
-        """
-        ✅ КРИТИЧЕСКИ ИСПРАВЛЕНО:
-        - Начинает с published_count (пропускает уже опубликованные посты)
-        - Сохраняет прогресс на диск после каждого поста
-        - После завершения удаляет пакет из running_batches.json
-        """
         posts = item.get("posts", [])
         schedule = item.get("schedule", [])
         category_data = item["category_data"]
@@ -665,10 +744,9 @@ class QueueManager:
         stars_price = item.get("stars_price")
         total = len(posts)
 
-        # ✅ Начинаем с места остановки (при возобновлении после перезапуска)
         start_from = item.get("published_count", 0)
         if start_from > 0:
-            logger.info(f"🔄 Пакет '{batch_name}': возобновляем с поста {start_from + 1}/{total}")
+            logger.info(f"🔄 Пакет '{batch_name}': продовжуємо з поста {start_from + 1}/{total}")
 
         config = load_config()
         platform_cfg = config.get("platforms", {}).get(platform_id, {})
@@ -685,7 +763,9 @@ class QueueManager:
                 item.get("selected_hashtags", []), platform_id
             )
         else:
-            caption = self._format_caption(category_data, item.get("selected_hashtags", []), platform_id)
+            caption = self._format_caption(
+                category_data, item.get("selected_hashtags", []), platform_id
+            )
 
         try:
             for i in range(start_from, total):
@@ -694,11 +774,9 @@ class QueueManager:
 
                 post_data = posts[i]
 
-                # Обновляем прогресс в памяти
                 if batch_id in self._running_batch_items:
                     self._running_batch_items[batch_id]["published_count"] = i
 
-                # Ждём нужного времени
                 if i < len(schedule):
                     sched_time = schedule[i]
                     if isinstance(sched_time, str):
@@ -722,40 +800,36 @@ class QueueManager:
                                     break
                                 await asyncio.sleep(min(remaining, 5.0))
                         elif wait_sec < -30:
-                            # Время прошло — публикуем сразу но с паузой между постами
                             missed_mins = int(abs(wait_sec) / 60)
                             logger.info(
-                                f"⚡ '{batch_name}' пост {i+1}/{total}: опоздание {missed_mins} мин "
-                                f"(перезапуск) — публикуем сразу"
+                                f"⚡ '{batch_name}' пост {i+1}/{total}: "
+                                f"запізнення {missed_mins} хв — публікуємо одразу"
                             )
-                            if i > start_from:  # Пауза только не для первого наверстанного поста
+                            if i > start_from:
                                 await asyncio.sleep(3)
 
                 if not self.running:
                     break
 
                 try:
-                    # Нормализуем формат данных поста
-                    # post_data это список: [(mtype, file_id), ...] или [(mtype, file_id)]
-                    # file_id — строка Telegram (не путь к файлу)
                     if not post_data:
-                        logger.warning(f"❌ '{batch_name}' пост {i+1}: пустые данные")
+                        logger.warning(f"❌ '{batch_name}' пост {i+1}: порожні дані")
                         continue
 
                     first = post_data[0]
                     if isinstance(first, (list, tuple)) and len(first) >= 2:
-                        # Стандартный формат: [(mtype, file_id), ...]
                         media_to_process = [(str(m[0]), str(m[1])) for m in post_data]
                     elif isinstance(first, str) and len(post_data) >= 2:
-                        # Плоский формат: [mtype, file_id]
                         media_to_process = [(str(post_data[0]), str(post_data[1]))]
                     else:
-                        logger.warning(f"❌ '{batch_name}' пост {i+1}: неизвестный формат данных: {post_data!r}")
+                        logger.warning(
+                            f"❌ '{batch_name}' пост {i+1}: невідомий формат: {post_data!r}"
+                        )
                         continue
 
                     processed = await media_processor.process_batch(media_to_process)
                     if not processed:
-                        logger.warning(f"❌ '{batch_name}' пост {i+1}: не удалось обработать медиа")
+                        logger.warning(f"❌ '{batch_name}' пост {i+1}: не вдалось обробити медіа")
                         continue
 
                     if stars_price and stars_price > 0:
@@ -776,25 +850,27 @@ class QueueManager:
 
                     media_processor.cleanup_specific([p for _, p in processed])
 
-                    # ✅ Сохраняем прогресс на диск после каждого поста
+                    # ✅ Зберігаємо прогрес після кожного поста (і в TG, і в файл)
                     published_at = datetime.now(KYIV_TZ).isoformat()
                     if batch_id in self._running_batch_items:
                         self._running_batch_items[batch_id]["published_count"] = i + 1
-                        self._running_batch_items[batch_id].setdefault("published_log", []).append(published_at)
-                        # Обновляем media_list — убираем уже опубликованные файлы
+                        self._running_batch_items[batch_id].setdefault(
+                            "published_log", []
+                        ).append(published_at)
                         fpp = self._running_batch_items[batch_id].get("files_per_post", 1)
-                        ml  = self._running_batch_items[batch_id].get("media_list", [])
+                        ml = self._running_batch_items[batch_id].get("media_list", [])
                         for _fi in range(min(fpp, len(ml))):
                             if not ml[_fi].get("published"):
                                 ml[_fi]["published"] = True
                                 break
-                        self._save_running_batches()  # ✅ НА ДИСК!
+                        self._save_running_batches()  # ✅ В Telegram + файл
 
-                    # Уведомляем сайт о публикации — счётчик постов обновится автоматически
                     try:
                         from keep_alive import notify_site_post_published
                         asyncio.create_task(
-                            notify_site_post_published(user_id=item.get("user_id", 0), count=1)
+                            notify_site_post_published(
+                                user_id=item.get("user_id", 0), count=1
+                            )
                         )
                     except Exception:
                         pass
@@ -804,27 +880,24 @@ class QueueManager:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.error(f"Ошибка поста {i+1} в пакете '{batch_name}': {e}")
-                    continue  # Продолжаем со следующим постом
+                    logger.error(f"Помилка поста {i+1} в пакеті '{batch_name}': {e}")
+                    continue
 
         except asyncio.CancelledError:
-            logger.warning(f"Пакет '{batch_name}' отменён")
-            # НЕ удаляем из running_batches.json — при следующем старте возобновим
+            logger.warning(f"Пакет '{batch_name}' скасовано")
+            # НЕ видаляємо — при наступному старті відновимо
             return
         except Exception as e:
-            logger.error(f"Критическая ошибка пакета '{batch_name}': {e}")
-            # Удаляем из активных, т.к. пакет не может продолжить работу
+            logger.error(f"Критична помилка пакету '{batch_name}': {e}")
             self._remove_running_batch(batch_id)
             return
 
-        # ✅ Удаляем из активных только после полного завершения
         self._remove_running_batch(batch_id)
-        logger.info(f"🎉 Пакет '{batch_name}' полностью завершён ({total} постов)")
+        logger.info(f"🎉 Пакет '{batch_name}' повністю завершено ({total} постів)")
 
-    async def _send_stars_post(self, bot, chat_id, thread_id, processed, caption, stars_price, media_processor):
-        """Отправка поста за звёзды через Telegram Stars (XTR)."""
+    async def _send_stars_post(self, bot, chat_id, thread_id, processed, caption,
+                               stars_price, media_processor):
         from aiogram.types import LabeledPrice
-
         try:
             if len(processed) == 1:
                 await media_processor.send_single_media(
@@ -835,21 +908,17 @@ class QueueManager:
 
             kwargs = dict(
                 chat_id=chat_id,
-                title="Эксклюзивный контент",
-                description=caption[:255] if caption else "Эксклюзивный контент",
+                title="Ексклюзивний контент",
+                description=caption[:255] if caption else "Ексклюзивний контент",
                 payload="stars_post",
                 currency="XTR",
-                prices=[LabeledPrice(label="Звёзды", amount=stars_price)],
+                prices=[LabeledPrice(label="Зірки", amount=stars_price)],
             )
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
-
             await bot.send_invoice(**kwargs)
-            logger.info(f"✅ Пост за звёзды: {stars_price} XTR")
-
         except Exception as e:
-            logger.error(f"Ошибка поста за звёзды: {e}")
-            # Fallback — публикуем как обычный пост
+            logger.error(f"Помилка поста за зірки: {e}")
             if len(processed) == 1:
                 await media_processor.send_single_media(
                     chat_id, processed[0][0], processed[0][1], caption, thread_id
@@ -877,9 +946,9 @@ class QueueManager:
             caption += "\n".join(rows) + "\n"
         caption += f"{emoji_row}\n\n"
         if platform_type == "channel":
-            caption += f"Получить бесплатно доступ к приватке ➡️ {referral_bot}\n"
+            caption += f"Отримати безкоштовний доступ до привату ➡️ {referral_bot}\n"
         caption += f"↘️⬇️↙️\n"
-        caption += f'<a href="{invite_link}">Ссылка для друга</a>'
+        caption += f'<a href="{invite_link}">Посилання для друга</a>'
         return caption
 
     def _format_comic_caption(self, category_data: Dict, comic_title: str, comic_link: str,
@@ -898,7 +967,7 @@ class QueueManager:
             caption += "\n".join(rows) + "\n\n"
         caption += f"{emoji_row}\n\n"
         if platform_type == "channel":
-            caption += f"Получить бесплатно доступ к приватке ➡️ {referral_bot}\n"
+            caption += f"Отримати безкоштовний доступ до привату ➡️ {referral_bot}\n"
         caption += f"↘️⬇️↙️\n"
-        caption += f'<a href="{invite_link}">Ссылка для друга</a>'
+        caption += f'<a href="{invite_link}">Посилання для друга</a>'
         return caption
