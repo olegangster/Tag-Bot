@@ -1,23 +1,23 @@
 """
-queue_manager.py — менеджер черги публікацій
+queue_manager.py — менеджер очереди публикаций
 
-✅ v4 — НЕВБИВАНА ЧЕРГА:
+✅ v4 — НЕУБИВАЕМАЯ ОЧЕРЕДЬ:
 
-ПРОБЛЕМА v3: running_batches.json і queue.json зберігались у файловій
-системі Render.com, яка знищується при кожному деплої/перезапуску.
-Код відновлення працював, але файлів вже не було.
+ПРОБЛЕМА v3: running_batches.json и queue.json хранились в файловой
+системе Render.com, которая уничтожается при каждом деплое/перезапуске.
+Код восстановления работал, но файлов уже не было.
 
-РІШЕННЯ v4:
-1. TelegramStateStorage — зберігає стан у Telegram повідомленнях.
-   Telegram — зовнішній сервіс, не залежить від файлової системи Render.
-2. При СТАРТІ — завантажуємо з Telegram (завжди актуально після деплою).
-3. При КОЖНОМУ ЗБЕРЕЖЕННІ — зберігаємо і в файл (кеш), і в Telegram.
-4. Якщо Telegram недоступний — fallback на локальний файл.
-5. Публічний API QueueManager не змінився — handlers.py не потребує змін.
+РЕШЕНИЕ v4:
+1. TelegramStateStorage — хранит состояние в Telegram сообщениях.
+   Telegram — внешний сервис, не зависит от файловой системы Render.
+2. При СТАРТЕ — загружаем из Telegram (всегда актуально после деплоя).
+3. При КАЖДОМ СОХРАНЕНИИ — сохраняем и в файл (кэш), и в Telegram.
+4. Если Telegram недоступен — fallback на локальный файл.
+5. Публичный API QueueManager не изменился — handlers.py не требует изменений.
 
-НАЛАШТУВАННЯ (додай у .env.txt або Render Environment Variables):
-    STORAGE_CHAT_ID=<твій_telegram_user_id>
-    # або залиш порожнім — тоді використається перший admin з ADMIN_IDS
+НАСТРОЙКА (добавь в .env.txt или Render Environment Variables):
+    STORAGE_CHAT_ID=<твой_telegram_user_id>
+    # или оставь пустым — тогда используется первый admin из ADMIN_IDS
 """
 import asyncio
 import json
@@ -63,7 +63,7 @@ def _str_to_dt(s) -> datetime:
 
 
 def _deserialize_schedule(data: list) -> list:
-    """Конвертує рядки ISO у datetime у всіх елементах списку."""
+    """Конвертирует строки ISO в datetime во всех элементах списка."""
     result = []
     for item in data:
         ic = dict(item)
@@ -74,7 +74,7 @@ def _deserialize_schedule(data: list) -> list:
 
 
 def _deserialize_running(data: dict) -> dict:
-    """Конвертує рядки ISO у datetime у running_batches."""
+    """Конвертирует строки ISO в datetime в running_batches."""
     result = {}
     for batch_id, item in data.items():
         ic = dict(item)
@@ -86,7 +86,7 @@ def _deserialize_running(data: dict) -> dict:
 
 class QueueManager:
     def __init__(self, filepath: str = "queue.json"):
-        # Локальний fallback-шлях
+        # Локальный fallback-путь
         render_cache = Path("/opt/render/project/.render")
         if render_cache.exists():
             data_dir = render_cache / "botdata"
@@ -100,10 +100,10 @@ class QueueManager:
         self.previews_dir = self.filepath.parent / "previews"
         self.previews_dir.mkdir(exist_ok=True)
 
-        # Telegram storage (ініціалізується асинхронно через setup())
+        # Telegram storage (инициализируется асинхронно через setup())
         self._tg_storage = None
 
-        # Стан у пам'яті
+        # Состояние в памяти
         self._queue: List[Dict] = self._load_queue_sync()
         self.running: bool = False
         self.interval: int = 60
@@ -117,8 +117,8 @@ class QueueManager:
 
     async def setup(self, bot):
         """
-        ✅ НОВИЙ МЕТОД: Підключає Telegram storage і підвантажує актуальний стан.
-        Викликати в bot.py після створення bot instance, до start_polling.
+        ✅ НОВЫЙ МЕТОД: Подключает Telegram storage и подгружает актуальное состояние.
+        Вызывать в bot.py после создания bot instance, до start_polling.
         """
         try:
             from telegram_state_storage import init_storage, TelegramStateStorage
@@ -126,40 +126,40 @@ class QueueManager:
             storage_chat_id = self._get_storage_chat_id()
             if not storage_chat_id:
                 logger.warning(
-                    "⚠️ STORAGE_CHAT_ID не задано — черга зберігається тільки локально. "
-                    "Додай STORAGE_CHAT_ID у .env.txt або змінні Render для невбивної черги."
+                    "⚠️ STORAGE_CHAT_ID не задан — очередь сохраняется только локально. "
+                    "Добавь STORAGE_CHAT_ID в .env.txt или переменные Render для неубиваемой очереди."
                 )
                 return
 
             self._tg_storage = init_storage(bot, storage_chat_id)
             await self._tg_storage.initialize()
 
-            # ✅ Завантажуємо актуальний стан з Telegram (завжди свіжий після деплою)
+            # ✅ Загружаем актуальное состояние из Telegram (всегда свежее после деплоя)
             queue_data = await self._tg_storage.load_queue()
             if queue_data is not None:
                 self._queue = _deserialize_schedule(queue_data)
-                logger.info(f"📥 Черга завантажена з Telegram: {len(self._queue)} елементів")
+                logger.info(f"📥 Очередь загружена из Telegram: {len(self._queue)} элементов")
 
             running_data = await self._tg_storage.load_running_batches()
             if running_data is not None:
                 self._running_batch_items = _deserialize_running(running_data)
                 if self._running_batch_items:
                     logger.info(
-                        f"🔄 Активні пакети відновлені з Telegram: "
+                        f"🔄 Активные пакеты восстановлены из Telegram: "
                         f"{len(self._running_batch_items)}"
                     )
 
         except ImportError:
             logger.warning(
-                "telegram_state_storage.py не знайдено — "
-                "черга зберігається тільки локально."
+                "telegram_state_storage.py не найден — "
+                "очередь сохраняется только локально."
             )
         except Exception as e:
-            logger.error(f"❌ setup() помилка: {e}")
+            logger.error(f"❌ setup() ошибка: {e}")
 
     def _get_storage_chat_id(self) -> Optional[int]:
-        """Повертає chat_id для зберігання стану."""
-        # Спочатку явно задане STORAGE_CHAT_ID
+        """Возвращает chat_id для хранения состояния."""
+        # Сначала явно заданный STORAGE_CHAT_ID
         val = os.getenv("STORAGE_CHAT_ID", "").strip()
         if val:
             try:
@@ -167,7 +167,7 @@ class QueueManager:
             except ValueError:
                 pass
 
-        # Fallback: перший admin з ADMIN_IDS
+        # Fallback: первый admin из ADMIN_IDS
         admin_ids = os.getenv("ADMIN_IDS", "").strip()
         if admin_ids:
             first = admin_ids.split(",")[0].strip()
@@ -186,10 +186,10 @@ class QueueManager:
                 with open(self.filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 result = _deserialize_schedule(data)
-                logger.info(f"📂 queue.json (локально): {len(result)} елементів")
+                logger.info(f"📂 queue.json (локально): {len(result)} элементов")
                 return result
             except Exception as e:
-                logger.error(f"Помилка читання queue.json: {e}")
+                logger.error(f"Ошибка чтения queue.json: {e}")
         return []
 
     def _load_running_batches_sync(self) -> Dict[str, Dict]:
@@ -202,7 +202,7 @@ class QueueManager:
                     logger.info(f"🔄 running_batches.json (локально): {len(result)}")
                 return result
             except Exception as e:
-                logger.error(f"Помилка читання running_batches.json: {e}")
+                logger.error(f"Ошибка чтения running_batches.json: {e}")
         return {}
 
     def _save_queue_local(self):
@@ -216,7 +216,7 @@ class QueueManager:
             with open(self.filepath, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"Помилка збереження queue.json: {e}")
+            logger.error(f"Ошибка сохранения queue.json: {e}")
 
     def _save_running_local(self):
         try:
@@ -229,24 +229,24 @@ class QueueManager:
             with open(self.running_filepath, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"Помилка збереження running_batches.json: {e}")
+            logger.error(f"Ошибка сохранения running_batches.json: {e}")
 
     # ─────────────────── Async save (Telegram + local) ──────────────────────
 
     def _save_queue(self):
-        """Синхронне збереження локально + запускає async збереження в Telegram."""
+        """Синхронное сохранение локально + запускает async сохранение в Telegram."""
         self._save_queue_local()
         if self._tg_storage:
             asyncio.create_task(self._save_queue_to_tg())
 
     def _save_running_batches(self):
-        """Синхронне збереження локально + запускає async збереження в Telegram."""
+        """Синхронное сохранение локально + запускает async сохранение в Telegram."""
         self._save_running_local()
         if self._tg_storage:
             asyncio.create_task(self._save_running_to_tg())
 
     async def _save_queue_to_tg(self):
-        """Зберігає чергу в Telegram (викликається як task)."""
+        """Сохраняет очередь в Telegram (вызывается как task)."""
         try:
             data = []
             for item in self._queue:
@@ -256,10 +256,10 @@ class QueueManager:
                 data.append(ic)
             await self._tg_storage.save_queue(data)
         except Exception as e:
-            logger.warning(f"Помилка збереження черги в Telegram: {e}")
+            logger.warning(f"Ошибка сохранения очереди в Telegram: {e}")
 
     async def _save_running_to_tg(self):
-        """Зберігає running_batches в Telegram (викликається як task)."""
+        """Сохраняет running_batches в Telegram (вызывается как task)."""
         try:
             data = {}
             for batch_id, item in self._running_batch_items.items():
@@ -269,9 +269,9 @@ class QueueManager:
                 data[batch_id] = ic
             await self._tg_storage.save_running_batches(data)
         except Exception as e:
-            logger.warning(f"Помилка збереження running_batches в Telegram: {e}")
+            logger.warning(f"Ошибка сохранения running_batches в Telegram: {e}")
 
-    # Аліас для зворотної сумісності
+    # Алиас для обратной совместимости
     def _save(self):
         self._save_queue()
 
@@ -285,8 +285,8 @@ class QueueManager:
             if preview_batch_dir.exists():
                 shutil.rmtree(preview_batch_dir)
         except Exception as e:
-            logger.warning(f"Не вдалось видалити превью пакету {batch_id}: {e}")
-        logger.info(f"✅ Пакет {batch_id} завершено і видалено з активних")
+            logger.warning(f"Не удалось удалить превью пакета {batch_id}: {e}")
+        logger.info(f"✅ Пакет {batch_id} завершён и удалён из активных")
 
     # ─────────────────────── Add items ───────────────────────────────────────
 
@@ -353,7 +353,7 @@ class QueueManager:
         item["posts"].extend(posts)
         item["schedule"].extend(schedule)
         self._save_running_batches()
-        logger.info(f"✅ Додано {len(posts)} постів в активний пакет {batch_id}")
+        logger.info(f"✅ Добавлено {len(posts)} постов в активный пакет {batch_id}")
         return batch_id
 
     # ─────────────────────── Queue access ────────────────────────────────────
@@ -429,7 +429,7 @@ class QueueManager:
                 if item.get("id"):
                     self.batch_service.cancel_batch_tasks(item["id"])
             self._save_queue()
-            logger.info(f"Видалено з черги: {item.get('name')}")
+            logger.info(f"Удалено из очереди: {item.get('name')}")
             return True
         return False
 
@@ -467,14 +467,14 @@ class QueueManager:
 
     def get_status_text(self, user_id: int = None) -> str:
         s = self.get_status(user_id)
-        icon = "🟢 Активна" if s["running"] else "🔴 Зупинена"
-        # ✅ Показуємо статус persistence
+        icon = "🟢 Активна" if s["running"] else "🔴 Остановлена"
+        # ✅ Показываем статус persistence
         tg_icon = "☁️" if self._tg_storage else "💾"
-        text = f"📥 <b>Черга публікацій</b> {tg_icon}\n\nСтатус: <b>{icon}</b>\n"
+        text = f"📥 <b>Очередь публикаций</b> {tg_icon}\n\nСтатус: <b>{icon}</b>\n"
 
         running_batches = s.get("running_batches", {})
         if s["running"] and running_batches:
-            text += f"\n<b>▶️ Публікується зараз ({len(running_batches)}):</b>\n"
+            text += f"\n<b>▶️ Публикуется сейчас ({len(running_batches)}):</b>\n"
             for batch_id, item in running_batches.items():
                 cat = item.get("category_data", {})
                 cat_name = f"{cat.get('emoji', '')} {cat.get('name', '—')}"
@@ -482,23 +482,23 @@ class QueueManager:
                 total = len(item.get("posts", []))
                 text += f"• {item.get('name', batch_id)} [{cat_name}]: <b>{published}/{total}</b>\n"
         elif s["running"] and s["active_progress"]:
-            text += f"▶️ Публікується: <i>{s['active_progress']}</i>\n"
+            text += f"▶️ Публикуется: <i>{s['active_progress']}</i>\n"
 
-        text += f"\n📋 В черзі: <b>{s['pending']}</b>\n"
-        text += f"⏱ Інтервал: <b>{s['interval']} хв</b>\n"
+        text += f"\n📋 В очереди: <b>{s['pending']}</b>\n"
+        text += f"⏱ Интервал: <b>{s['interval']} мин</b>\n"
 
         if not self._tg_storage:
-            text += "\n⚠️ <i>Додай STORAGE_CHAT_ID для невбивної черги</i>"
+            text += "\n⚠️ <i>Добавь STORAGE_CHAT_ID для неубиваемой очереди</i>"
 
         if running_batches:
-            text += "\n\n💡 Натисни <b>📊 Прогрес</b> для деталей"
+            text += "\n\n💡 Нажми <b>📊 Прогресс</b> для деталей"
 
         return text
 
     def get_running_batch_detail_text(self, batch_id: str) -> str:
         item = self._running_batch_items.get(batch_id)
         if not item:
-            return "⚠️ Пакет вже завершено або не знайдено"
+            return "⚠️ Пакет уже завершён или не найден"
 
         cat = item.get("category_data", {})
         cat_name = f"{cat.get('emoji', '')} {cat.get('name', '—')}"
@@ -508,11 +508,11 @@ class QueueManager:
         total = len(item.get("posts", []))
 
         text = f"📦 <b>{item.get('name', batch_id)}</b>\n"
-        text += f"📁 Категорія: {cat_name}\n"
-        text += f"📊 Прогрес: <b>{published_count}/{total}</b>\n\n"
+        text += f"📁 Категория: {cat_name}\n"
+        text += f"📊 Прогресс: <b>{published_count}/{total}</b>\n\n"
 
         if published_log:
-            text += "✅ <b>Вже опубліковано:</b>\n"
+            text += "✅ <b>Уже опубликовано:</b>\n"
             for ts in published_log[-10:]:
                 try:
                     dt = _str_to_dt(ts)
@@ -524,7 +524,7 @@ class QueueManager:
 
         remaining_schedule = schedule[published_count:]
         if remaining_schedule:
-            text += "⏳ <b>Заплановано:</b>\n"
+            text += "⏳ <b>Запланировано:</b>\n"
             for s in remaining_schedule[:10]:
                 try:
                     dt = _str_to_dt(s)
@@ -533,7 +533,7 @@ class QueueManager:
                 except Exception:
                     text += f"  • {s}\n"
             if len(remaining_schedule) > 10:
-                text += f"  ... і ще {len(remaining_schedule) - 10}\n"
+                text += f"  ... и ещё {len(remaining_schedule) - 10}\n"
 
         return text
 
@@ -543,7 +543,7 @@ class QueueManager:
             if user_id is None or item.get("user_id") == user_id
         }
         if not items:
-            return "▶️ Немає активних пакетів"
+            return "▶️ Нет активных пакетов"
         text = ""
         for batch_id in items:
             text += self.get_running_batch_detail_text(batch_id)
@@ -564,7 +564,7 @@ class QueueManager:
         self._task = asyncio.create_task(
             self._process_queue_loop(media_processor, bot)
         )
-        logger.info("▶️ Черга запущена")
+        logger.info("▶️ Очередь запущена")
         return True
 
     async def stop_queue(self):
@@ -577,20 +577,20 @@ class QueueManager:
                 await self._task
             except asyncio.CancelledError:
                 pass
-        logger.info("⏹ Черга зупинена")
+        logger.info("⏹ Очередь остановлена")
 
     # ─────────────────────── Queue loop ──────────────────────────────────────
 
     async def _process_queue_loop(self, media_processor, bot):
-        logger.info("▶️ Цикл черги запущено")
+        logger.info("▶️ Цикл очереди запущен")
         batch_tasks: dict = {}
 
-        # Відновлення перерваних пакетів після рестарту
+        # Восстановление прерванных пакетов после рестарта
         for batch_id, item in list(self._running_batch_items.items()):
             if batch_id not in batch_tasks:
                 logger.info(
-                    f"🔄 Відновлюємо пакет '{item.get('name')}' "
-                    f"(опубліковано: {item.get('published_count', 0)}/{len(item.get('posts', []))})"
+                    f"🔄 Восстанавливаем пакет '{item.get('name')}' "
+                    f"(опубликовано: {item.get('published_count', 0)}/{len(item.get('posts', []))})"
                 )
                 task = asyncio.create_task(
                     self._publish_batch(batch_id, item, media_processor, bot)
@@ -611,7 +611,7 @@ class QueueManager:
 
             try:
                 if item["type"] == "batch":
-                    logger.info(f"🚀 Запуск пакету '{item.get('name')}'")
+                    logger.info(f"🚀 Запуск пакета '{item.get('name')}'")
 
                     _raw_posts = item.get("posts", [])
                     _media_list = []
@@ -632,7 +632,7 @@ class QueueManager:
                         "total_posts_count": len(_raw_posts),
                     }
                     self._running_batch_items[item["id"]] = running_item
-                    self._save_running_batches()  # ✅ Зберігаємо до видалення з черги
+                    self._save_running_batches()  # ✅ Сохраняем до удаления из очереди
 
                     task = asyncio.create_task(
                         self._publish_batch(item["id"], running_item, media_processor, bot)
@@ -655,7 +655,7 @@ class QueueManager:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Помилка публікації: {e}")
+                logger.error(f"Ошибка публикации: {e}")
                 if self._queue and self._queue[0].get("id") == item.get("id"):
                     self._queue.pop(0)
                     self._save_queue()
@@ -668,18 +668,18 @@ class QueueManager:
 
         remaining = {bid: t for bid, t in batch_tasks.items() if not t.done()}
         if remaining:
-            logger.info(f"⏳ Очікування завершення {len(remaining)} активних пакетів...")
+            logger.info(f"⏳ Ожидание завершения {len(remaining)} активных пакетов...")
             for batch_id, task in remaining.items():
                 try:
                     await asyncio.wait_for(task, timeout=10.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
-                    logger.warning(f"Пакет {batch_id} не завершився: {e}")
+                    logger.warning(f"Пакет {batch_id} не завершился: {e}")
                     task.cancel()
 
         self._active_id = None
         self._active_progress = ""
         self.running = False
-        logger.info("✅ Цикл черги завершено")
+        logger.info("✅ Цикл очереди завершён")
 
     # ─────────────────────── Publish helpers ─────────────────────────────────
 
@@ -706,9 +706,9 @@ class QueueManager:
                 f"{category_data.get('emoji_row', '')}\n\n"
             )
             if platform_type == "channel":
-                caption += f"Отримати безкоштовний доступ до привату ➡️ {referral_bot}\n"
+                caption += f"Получить бесплатный доступ к привату ➡️ {referral_bot}\n"
             caption += f"↘️⬇️↙️\n"
-            caption += f'<a href="{invite_link}">Посилання для друга</a>'
+            caption += f'<a href="{invite_link}">Ссылка для друга</a>'
             kwargs = dict(chat_id=chat_id, text=caption, parse_mode="HTML")
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
@@ -732,7 +732,7 @@ class QueueManager:
                     chat_id, processed, caption, thread_id
                 )
             media_processor.cleanup_specific([p for _, p in processed])
-        logger.info(f"✅ '{item.get('name')}' опубліковано")
+        logger.info(f"✅ '{item.get('name')}' опубликовано")
 
     async def _publish_batch(self, batch_id: str, item: Dict, media_processor, bot):
         posts = item.get("posts", [])
@@ -746,7 +746,7 @@ class QueueManager:
 
         start_from = item.get("published_count", 0)
         if start_from > 0:
-            logger.info(f"🔄 Пакет '{batch_name}': продовжуємо з поста {start_from + 1}/{total}")
+            logger.info(f"🔄 Пакет '{batch_name}': продолжаем с поста {start_from + 1}/{total}")
 
         config = load_config()
         platform_cfg = config.get("platforms", {}).get(platform_id, {})
@@ -781,6 +781,7 @@ class QueueManager:
                     sched_time = schedule[i]
                     if isinstance(sched_time, str):
                         sched_time = _str_to_dt(sched_time)
+
                     if isinstance(sched_time, datetime):
                         if sched_time.tzinfo is None:
                             sched_time = KYIV_TZ.localize(sched_time)
@@ -803,7 +804,7 @@ class QueueManager:
                             missed_mins = int(abs(wait_sec) / 60)
                             logger.info(
                                 f"⚡ '{batch_name}' пост {i+1}/{total}: "
-                                f"запізнення {missed_mins} хв — публікуємо одразу"
+                                f"опоздание {missed_mins} мин — публикуем сразу"
                             )
                             if i > start_from:
                                 await asyncio.sleep(3)
@@ -813,7 +814,7 @@ class QueueManager:
 
                 try:
                     if not post_data:
-                        logger.warning(f"❌ '{batch_name}' пост {i+1}: порожні дані")
+                        logger.warning(f"❌ '{batch_name}' пост {i+1}: пустые данные")
                         continue
 
                     first = post_data[0]
@@ -823,13 +824,13 @@ class QueueManager:
                         media_to_process = [(str(post_data[0]), str(post_data[1]))]
                     else:
                         logger.warning(
-                            f"❌ '{batch_name}' пост {i+1}: невідомий формат: {post_data!r}"
+                            f"❌ '{batch_name}' пост {i+1}: неизвестный формат: {post_data!r}"
                         )
                         continue
 
                     processed = await media_processor.process_batch(media_to_process)
                     if not processed:
-                        logger.warning(f"❌ '{batch_name}' пост {i+1}: не вдалось обробити медіа")
+                        logger.warning(f"❌ '{batch_name}' пост {i+1}: не удалось обработать медиа")
                         continue
 
                     if stars_price and stars_price > 0:
@@ -850,7 +851,7 @@ class QueueManager:
 
                     media_processor.cleanup_specific([p for _, p in processed])
 
-                    # ✅ Зберігаємо прогрес після кожного поста (і в TG, і в файл)
+                    # ✅ Сохраняем прогресс после каждого поста (и в TG, и в файл)
                     published_at = datetime.now(KYIV_TZ).isoformat()
                     if batch_id in self._running_batch_items:
                         self._running_batch_items[batch_id]["published_count"] = i + 1
@@ -880,20 +881,20 @@ class QueueManager:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.error(f"Помилка поста {i+1} в пакеті '{batch_name}': {e}")
+                    logger.error(f"Ошибка поста {i+1} в пакете '{batch_name}': {e}")
                     continue
 
         except asyncio.CancelledError:
-            logger.warning(f"Пакет '{batch_name}' скасовано")
-            # НЕ видаляємо — при наступному старті відновимо
+            logger.warning(f"Пакет '{batch_name}' отменён")
+            # НЕ удаляем — при следующем старте восстановим
             return
         except Exception as e:
-            logger.error(f"Критична помилка пакету '{batch_name}': {e}")
+            logger.error(f"Критическая ошибка пакета '{batch_name}': {e}")
             self._remove_running_batch(batch_id)
             return
 
         self._remove_running_batch(batch_id)
-        logger.info(f"🎉 Пакет '{batch_name}' повністю завершено ({total} постів)")
+        logger.info(f"🎉 Пакет '{batch_name}' полностью завершён ({total} постов)")
 
     async def _send_stars_post(self, bot, chat_id, thread_id, processed, caption,
                                stars_price, media_processor):
@@ -908,17 +909,17 @@ class QueueManager:
 
             kwargs = dict(
                 chat_id=chat_id,
-                title="Ексклюзивний контент",
-                description=caption[:255] if caption else "Ексклюзивний контент",
+                title="Эксклюзивный контент",
+                description=caption[:255] if caption else "Эксклюзивный контент",
                 payload="stars_post",
                 currency="XTR",
-                prices=[LabeledPrice(label="Зірки", amount=stars_price)],
+                prices=[LabeledPrice(label="Звёзды", amount=stars_price)],
             )
             if thread_id:
                 kwargs["message_thread_id"] = thread_id
             await bot.send_invoice(**kwargs)
         except Exception as e:
-            logger.error(f"Помилка поста за зірки: {e}")
+            logger.error(f"Ошибка поста за звёзды: {e}")
             if len(processed) == 1:
                 await media_processor.send_single_media(
                     chat_id, processed[0][0], processed[0][1], caption, thread_id
@@ -946,9 +947,9 @@ class QueueManager:
             caption += "\n".join(rows) + "\n"
         caption += f"{emoji_row}\n\n"
         if platform_type == "channel":
-            caption += f"Отримати безкоштовний доступ до привату ➡️ {referral_bot}\n"
+            caption += f"Получить бесплатный доступ к привату ➡️ {referral_bot}\n"
         caption += f"↘️⬇️↙️\n"
-        caption += f'<a href="{invite_link}">Посилання для друга</a>'
+        caption += f'<a href="{invite_link}">Ссылка для друга</a>'
         return caption
 
     def _format_comic_caption(self, category_data: Dict, comic_title: str, comic_link: str,
@@ -967,7 +968,7 @@ class QueueManager:
             caption += "\n".join(rows) + "\n\n"
         caption += f"{emoji_row}\n\n"
         if platform_type == "channel":
-            caption += f"Отримати безкоштовний доступ до привату ➡️ {referral_bot}\n"
+            caption += f"Получить бесплатный доступ к привату ➡️ {referral_bot}\n"
         caption += f"↘️⬇️↙️\n"
-        caption += f'<a href="{invite_link}">Посилання для друга</a>'
+        caption += f'<a href="{invite_link}">Ссылка для друга</a>'
         return caption
