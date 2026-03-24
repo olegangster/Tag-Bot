@@ -237,13 +237,21 @@ class QueueManager:
         """Синхронное сохранение локально + запускает async сохранение в Telegram."""
         self._save_queue_local()
         if self._tg_storage:
-            asyncio.create_task(self._save_queue_to_tg())
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._save_queue_to_tg())
+            except RuntimeError:
+                pass  # Event loop не запущен — только локальное сохранение
 
     def _save_running_batches(self):
         """Синхронное сохранение локально + запускает async сохранение в Telegram."""
         self._save_running_local()
         if self._tg_storage:
-            asyncio.create_task(self._save_running_to_tg())
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._save_running_to_tg())
+            except RuntimeError:
+                pass  # Event loop не запущен — только локальное сохранение
 
     async def _save_queue_to_tg(self):
         """Сохраняет очередь в Telegram (вызывается как task)."""
