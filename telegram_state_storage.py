@@ -2,23 +2,23 @@
 telegram_state_storage.py — Персистентное хранилище состояния очереди через Telegram
 
 ПРОБЛЕМА: Render.com при деплое уничтожает все файлы контейнера.
-Даже /opt/render/project/.render/ сбрасывается при новом деплое.
 
-РЕШЕНИЕ: Хранить queue.json и running_batches.json как сообщения
-в Telegram (pinned message в чате админа). Telegram — это внешний
-сервис, который не зависит от файловой системы Render.
+РЕШЕНИЕ: Хранить queue + running_batches как JSON в одном Telegram-сообщении.
+Telegram — внешний сервис, не зависит от файловой системы Render.
 
-АРХИТЕКТУРА:
-- Сохраняем состояние как JSON в pinned-сообщении в STORAGE_CHAT_ID
-- При старте — загружаем из Telegram, если файл пустой/отсутствует
-- При каждом обновлении — сохраняем и в файл (кэш), и в Telegram
-- Файл — быстрый локальный кэш, Telegram — надёжный persistent backup
+КАК РАБОТАЕТ:
+1. При первом запуске бот отправляет «служебное» сообщение и выводит его
+   message_id в лог. Сохрани это число как STATE_MSG_ID на Render.
+2. При каждом изменении очереди — editMessageText этого сообщения (JSON).
+3. При старте бота — читаем JSON из этого сообщения через forwardMessage.
+4. Локальный файл tg_state_cache.json — быстрый кэш между save/load.
 
-НАСТРОЙКА:
-Добавь в .env.txt:
-    STORAGE_CHAT_ID=<твой_user_id или id приватного канала>
+НАСТРОЙКА (добавь в .env.txt или Render Environment Variables):
+    STORAGE_CHAT_ID=<твой_telegram_user_id>
+    STATE_MSG_ID=<message_id>   ← появится в логах при первом запуске
 
-Если STORAGE_CHAT_ID не задан — используется первый admin из ADMIN_IDS.
+ВАЖНО: STATE_MSG_ID нужно добавить один раз после первого запуска.
+Без него очередь не будет восстанавливаться после рестарта.
 """
 
 import asyncio
@@ -35,32 +35,31 @@ logger = logging.getLogger(__name__)
 
 KYIV_TZ = pytz.timezone('Europe/Kiev')
 
-# Теги для идентификации сообщений с состоянием
-_TAG_QUEUE = "🗃️ BOT_STATE:queue"
-_TAG_RUNNING = "🗃️ BOT_STATE:running_batches"
-_STATE_MARKER = "⚙️ BOT STATE STORAGE — НЕ УДАЛЯТЬ"
+_STATE_MARKER = "#BOT_STATE"
+_MAX_TG_LEN = 3800  # Запас от лимита 4096
 
 
 def _dt_serial(obj):
-    """JSON serializer для datetime."""
     if isinstance(obj, datetime):
         if obj.tzinfo is None:
             obj = KYIV_TZ.localize(obj)
         return obj.isoformat()
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+    raise TypeError(f"Not serializable: {type(obj)}")
 
 
 class TelegramStateStorage:
     """
-    Хранит состояние очереди в Telegram как pinned-сообщение.
-    Работает как прозрачный слой поверх файлового хранилища.
+    Хранит очередь и активные пакеты в одном Telegram-сообщении.
     """
 
     def __init__(self, bot, storage_chat_id: int, local_dir: Path = None):
         self.bot = bot
         self.storage_chat_id = storage_chat_id
 
-        # Локальный кэш (файлы) — для быстрого чтения
+        # message_id служебного сообщения
+        self._state_msg_id: Optional[int] = self._read_msg_id_from_env()
+
+        # Локальный кэш-файл
         if local_dir is None:
             render_cache = Path("/opt/render/project/.render")
             if render_cache.exists():
@@ -69,249 +68,226 @@ class TelegramStateStorage:
             else:
                 local_dir = Path(".")
         self.local_dir = local_dir
+        self._cache_file = self.local_dir / "tg_state_cache.json"
 
-        # ID сообщений с состоянием (заполняется при инициализации)
-        self._queue_msg_id: Optional[int] = None
-        self._running_msg_id: Optional[int] = None
+        # In-memory кэш (актуальное состояние)
+        self._mem_state: Optional[dict] = None
         self._initialized = False
 
+    def _read_msg_id_from_env(self) -> Optional[int]:
+        val = os.getenv("STATE_MSG_ID", "").strip()
+        if val:
+            try:
+                return int(val)
+            except ValueError:
+                logger.warning(f"Некорректный STATE_MSG_ID={val!r}")
+        return None
+
+    # ─── Init ────────────────────────────────────────────────────────────────
+
     async def initialize(self):
-        """
-        Находит или создаёт служебные сообщения в Telegram.
-        Вызывается один раз при старте бота.
-        """
+        """Вызывается один раз при старте. Загружает состояние из Telegram."""
         if self._initialized:
             return
+        self._initialized = True
 
         try:
-            # Ищем существующие pinned-сообщения с состоянием
-            await self._find_or_create_state_messages()
-            self._initialized = True
-            logger.info(
-                f"✅ TelegramStateStorage инициализировано "
-                f"(chat_id={self.storage_chat_id}, "
-                f"queue_msg={self._queue_msg_id}, "
-                f"running_msg={self._running_msg_id})"
-            )
+            if self._state_msg_id:
+                state = await self._fetch_from_telegram()
+                if state is not None:
+                    self._mem_state = state
+                    self._write_cache(state)
+                    logger.info(
+                        f"✅ Загружено из Telegram msg_id={self._state_msg_id}: "
+                        f"queue={len(state.get('queue', []))}, "
+                        f"running={len(state.get('running_batches', {}))}"
+                    )
+                    return
+                else:
+                    logger.warning(
+                        f"Не удалось прочитать msg_id={self._state_msg_id} из Telegram. "
+                        f"Пробуем локальный кэш..."
+                    )
+            else:
+                logger.warning(
+                    "STATE_MSG_ID не задан — очередь не восстановится после рестарта. "
+                    "Создаём новое служебное сообщение..."
+                )
+
+            # Пробуем локальный кэш
+            cached = self._read_cache()
+            if cached:
+                self._mem_state = cached
+                logger.info(f"📂 Загружено из локального кэша: queue={len(cached.get('queue', []))}")
+                # Сразу пишем в Telegram чтобы создать/восстановить сообщение
+                await self._ensure_state_message_exists()
+                await self._push_to_telegram(cached)
+            else:
+                self._mem_state = {"queue": [], "running_batches": {}}
+                await self._ensure_state_message_exists()
+
         except Exception as e:
-            logger.error(f"❌ TelegramStateStorage инициализация провалилась: {e}")
-            # Продолжаем без Telegram storage — будет только файловый fallback
-            self._initialized = True
+            logger.error(f"❌ TelegramStateStorage.initialize(): {e}", exc_info=True)
+            if self._mem_state is None:
+                self._mem_state = {"queue": [], "running_batches": {}}
 
-    async def _find_or_create_state_messages(self):
-        """Находит существующие или создаёт новые сообщения для хранения состояния."""
-        # Получаем pinned message чата
+    async def _ensure_state_message_exists(self):
+        """Создаёт служебное сообщение если его нет."""
+        if self._state_msg_id:
+            return
         try:
-            chat = await self.bot.get_chat(self.storage_chat_id)
-            pinned = getattr(chat, 'pinned_message', None)
-            if pinned and _STATE_MARKER in (pinned.text or ""):
-                # Есть pinned message — парсим message_id оттуда
-                await self._parse_index_message(pinned.text)
-                return
-        except Exception as e:
-            logger.warning(f"Не удалось получить pinned message: {e}")
-
-        # Поиск через getUpdates / history невозможен через Bot API.
-        # Поэтому просто создаём новые сообщения.
-        await self._create_state_messages()
-
-    async def _create_state_messages(self):
-        """Создаёт новые служебные сообщения."""
-        try:
-            # Сообщение для queue
-            q_msg = await self.bot.send_message(
+            msg = await self.bot.send_message(
                 self.storage_chat_id,
-                f"{_TAG_QUEUE}\n[]"
+                f"{_STATE_MARKER}\n{{}}",
+                disable_notification=True,
             )
-            self._queue_msg_id = q_msg.message_id
-
-            # Сообщение для running_batches
-            r_msg = await self.bot.send_message(
-                self.storage_chat_id,
-                f"{_TAG_RUNNING}\n{{}}"
-            )
-            self._running_msg_id = r_msg.message_id
-
-            # Индексное сообщение с ID обоих
-            index_text = (
-                f"{_STATE_MARKER}\n"
-                f"queue_msg_id: {self._queue_msg_id}\n"
-                f"running_msg_id: {self._running_msg_id}\n"
-                f"created: {datetime.now(KYIV_TZ).isoformat()}"
-            )
-            index_msg = await self.bot.send_message(
-                self.storage_chat_id, index_text
-            )
-            # Закрепляем индексное сообщение
+            self._state_msg_id = msg.message_id
             try:
                 await self.bot.pin_chat_message(
                     self.storage_chat_id,
-                    index_msg.message_id,
-                    disable_notification=True
-                )
-            except Exception:
-                pass  # Возможно нет прав — не критично
-
-            logger.info(
-                f"✅ Созданы state messages: "
-                f"queue={self._queue_msg_id}, running={self._running_msg_id}"
-            )
-        except Exception as e:
-            logger.error(f"❌ Не удалось создать state messages: {e}")
-
-    async def _parse_index_message(self, text: str):
-        """Парсит ID сообщений из индексного сообщения."""
-        try:
-            for line in text.split('\n'):
-                if line.startswith('queue_msg_id:'):
-                    self._queue_msg_id = int(line.split(':')[1].strip())
-                elif line.startswith('running_msg_id:'):
-                    self._running_msg_id = int(line.split(':')[1].strip())
-            logger.info(
-                f"📌 Найдены state messages: "
-                f"queue={self._queue_msg_id}, running={self._running_msg_id}"
-            )
-        except Exception as e:
-            logger.warning(f"Ошибка парсинга index message: {e}")
-            await self._create_state_messages()
-
-    # ─── Public API ───────────────────────────────────────────────────────────
-
-    async def load_queue(self) -> list:
-        """Загружает очередь: сначала из Telegram, fallback на файл."""
-        data = await self._load_from_telegram(self._queue_msg_id, _TAG_QUEUE)
-        if data is not None:
-            self._save_local("queue.json", data)
-            return data if isinstance(data, list) else []
-
-        # Fallback: читаем из файла
-        return self._load_local("queue.json", default=[])
-
-    async def save_queue(self, queue: list):
-        """Сохраняет очередь в Telegram и локально."""
-        self._save_local("queue.json", queue)
-        await self._save_to_telegram(self._queue_msg_id, _TAG_QUEUE, queue)
-
-    async def load_running_batches(self) -> dict:
-        """Загружает активные пакеты: сначала из Telegram, fallback на файл."""
-        data = await self._load_from_telegram(
-            self._running_msg_id, _TAG_RUNNING
-        )
-        if data is not None:
-            self._save_local("running_batches.json", data)
-            return data if isinstance(data, dict) else {}
-
-        return self._load_local("running_batches.json", default={})
-
-    async def save_running_batches(self, batches: dict):
-        """Сохраняет активные пакеты в Telegram и локально."""
-        self._save_local("running_batches.json", batches)
-        await self._save_to_telegram(
-            self._running_msg_id, _TAG_RUNNING, batches
-        )
-
-    # ─── Telegram I/O ─────────────────────────────────────────────────────────
-
-    async def _load_from_telegram(self, msg_id: Optional[int], tag: str):
-        """Загружает JSON из Telegram сообщения."""
-        if not msg_id or not self.storage_chat_id:
-            return None
-
-        try:
-            # Пересылаем сообщение самому себе чтобы получить текст
-            # (forward + get_chat не даёт текст, нужен copyMessage или forwardMessage)
-            # Используем Bot API напрямую через сессию
-            from aiogram.methods import ForwardMessage
-            fwd = await self.bot(
-                ForwardMessage(
-                    chat_id=self.storage_chat_id,
-                    from_chat_id=self.storage_chat_id,
-                    message_id=msg_id,
-                )
-            )
-            text = fwd.text or ""
-            # Удаляем пересланный дубль
-            try:
-                await self.bot.delete_message(
-                    self.storage_chat_id, fwd.message_id
+                    msg.message_id,
+                    disable_notification=True,
                 )
             except Exception:
                 pass
+            logger.info(
+                f"\n{'='*50}\n"
+                f"✅ Служебное сообщение создано!\n"
+                f"   Добавь в Render Environment Variables:\n"
+                f"   STATE_MSG_ID={self._state_msg_id}\n"
+                f"{'='*50}"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось создать служебное сообщение: {e}")
 
-            if tag not in text:
-                logger.warning(f"Тег '{tag}' не найден в сообщении {msg_id}")
+    # ─── Telegram I/O ────────────────────────────────────────────────────────
+
+    async def _fetch_from_telegram(self) -> Optional[dict]:
+        """
+        Читает JSON из служебного сообщения.
+        Telegram Bot API не позволяет читать сообщения по ID напрямую.
+        Используем forward: пересылаем сообщение себе, читаем текст, удаляем.
+        """
+        if not self._state_msg_id:
+            return None
+        try:
+            fwd = await self.bot.forward_message(
+                chat_id=self.storage_chat_id,
+                from_chat_id=self.storage_chat_id,
+                message_id=self._state_msg_id,
+                disable_notification=True,
+            )
+            text = fwd.text or fwd.caption or ""
+            try:
+                await self.bot.delete_message(self.storage_chat_id, fwd.message_id)
+            except Exception:
+                pass
+
+            if _STATE_MARKER not in text:
+                logger.warning(f"Маркер {_STATE_MARKER!r} не найден в сообщении")
                 return None
 
-            # JSON после первого \n
-            json_str = text[text.index('\n') + 1:]
+            json_str = text[text.index('\n') + 1:].strip()
+            if not json_str or json_str == "{}":
+                return {"queue": [], "running_batches": {}}
+
             return json.loads(json_str)
 
         except Exception as e:
-            logger.warning(f"_load_from_telegram msg={msg_id}: {e}")
+            logger.warning(f"_fetch_from_telegram: {e}")
             return None
 
-    async def _save_to_telegram(self, msg_id: Optional[int], tag: str, data):
-        """Сохраняет JSON в Telegram сообщение через editMessageText."""
-        if not msg_id or not self.storage_chat_id:
+    async def _push_to_telegram(self, state: dict):
+        """Записывает JSON в служебное сообщение через editMessageText."""
+        if not self._state_msg_id:
             return
 
         try:
-            json_str = json.dumps(data, ensure_ascii=False, default=_dt_serial)
-            new_text = f"{tag}\n{json_str}"
+            json_str = json.dumps(
+                state, ensure_ascii=False,
+                separators=(',', ':'), default=_dt_serial
+            )
+            text = f"{_STATE_MARKER}\n{json_str}"
 
-            # Telegram ограничивает сообщения 4096 символами
-            if len(new_text) > 4096:
-                # Сжимаем: удаляем пробелы из JSON
-                json_str = json.dumps(
-                    data, ensure_ascii=False,
-                    default=_dt_serial, separators=(',', ':')
-                )
-                new_text = f"{tag}\n{json_str}"
-
-            if len(new_text) > 4096:
-                # Данные слишком большие для одного сообщения
-                # Сохраняем только локально и логируем предупреждение
+            if len(text) > _MAX_TG_LEN:
+                # Очередь слишком большая — сохраняем только локально
                 logger.warning(
-                    f"⚠️ Состояние слишком большое для Telegram ({len(new_text)} chars). "
-                    f"Сохраняем только локально."
+                    f"⚠️ Состояние слишком большое ({len(text)} chars > {_MAX_TG_LEN}). "
+                    f"Только локальный кэш."
                 )
                 return
 
             await self.bot.edit_message_text(
                 chat_id=self.storage_chat_id,
-                message_id=msg_id,
-                text=new_text,
+                message_id=self._state_msg_id,
+                text=text,
             )
+
         except Exception as e:
-            logger.warning(f"_save_to_telegram msg={msg_id}: {e}")
+            err = str(e).lower()
+            if "message is not modified" in err:
+                pass  # Данные не изменились — ок
+            elif "message to edit not found" in err or "message_id_invalid" in err:
+                logger.warning(
+                    f"Служебное сообщение {self._state_msg_id} удалено. "
+                    f"Создаём новое..."
+                )
+                self._state_msg_id = None
+                await self._ensure_state_message_exists()
+                # Повторная попытка
+                await self._push_to_telegram(state)
+            else:
+                logger.warning(f"_push_to_telegram: {e}")
 
-    # ─── Local file fallback ───────────────────────────────────────────────────
+    # ─── Local cache ─────────────────────────────────────────────────────────
 
-    def _local_path(self, filename: str) -> Path:
-        return self.local_dir / filename
+    def _write_cache(self, state: dict):
+        try:
+            with open(self._cache_file, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False, indent=2, default=_dt_serial)
+        except Exception as e:
+            logger.warning(f"Ошибка записи кэша: {e}")
 
-    def _load_local(self, filename: str, default=None):
-        path = self._local_path(filename)
-        if path.exists():
+    def _read_cache(self) -> Optional[dict]:
+        if self._cache_file.exists():
             try:
-                with open(path, 'r', encoding='utf-8') as f:
+                with open(self._cache_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except Exception as e:
-                logger.warning(f"Ошибка чтения {filename}: {e}")
-        return default if default is not None else {}
+                logger.warning(f"Ошибка чтения кэша: {e}")
+        return None
 
-    def _save_local(self, filename: str, data):
-        path = self._local_path(filename)
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False,
-                          indent=2, default=_dt_serial)
-        except Exception as e:
-            logger.warning(f"Ошибка записи {filename}: {e}")
+    # ─── Public API ───────────────────────────────────────────────────────────
+
+    def _get_state(self) -> dict:
+        if self._mem_state is None:
+            self._mem_state = self._read_cache() or {"queue": [], "running_batches": {}}
+        return self._mem_state
+
+    async def _save_state(self, state: dict):
+        self._mem_state = state
+        self._write_cache(state)
+        # Не блокируем основной поток
+        asyncio.create_task(self._push_to_telegram(state))
+
+    async def load_queue(self) -> list:
+        return self._get_state().get("queue", [])
+
+    async def save_queue(self, queue: list):
+        state = self._get_state()
+        state["queue"] = queue
+        await self._save_state(state)
+
+    async def load_running_batches(self) -> dict:
+        return self._get_state().get("running_batches", {})
+
+    async def save_running_batches(self, batches: dict):
+        state = self._get_state()
+        state["running_batches"] = batches
+        await self._save_state(state)
 
 
 # ─── Глобальный экземпляр ─────────────────────────────────────────────────────
-# Инициализируется в bot.py после создания bot instance
 
 _storage: Optional[TelegramStateStorage] = None
 
