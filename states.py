@@ -38,3 +38,20 @@ class QueueFlow(StatesGroup):
 
 class SettingsFlow(StatesGroup):
     pass
+
+
+class CategoryEditorFlow(StatesGroup):
+    # Менеджер категорий
+    menu = State()                      # список категорий пользователя
+    adding_name = State()               # ввод названия новой категории
+    adding_emoji = State()              # ввод эмодзи
+    adding_emoji_row = State()          # ввод строки эмодзи
+    adding_platform = State()           # выбор платформы
+    adding_topic = State()              # выбор топика (для группы)
+    # Редактирование существующей
+    edit_menu = State()                 # меню редактирования
+    edit_name = State()                 # изменение названия
+    edit_emoji = State()                # изменение эмодзи
+    edit_emoji_row = State()            # изменение строки эмодзи
+    edit_platform = State()             # переключение платформы
+    edit_topic = State()                # изменение топика
