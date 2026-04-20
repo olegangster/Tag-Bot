@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import pytz
 
-from states import PostFlow, QueueFlow, HashtagFlow
+from states import PostFlow, QueueFlow, HashtagFlow, CategoryEditorFlow
 from keyboards import *
 from media_processor import MediaProcessor
 from batch_service import BatchPostingService
@@ -2633,20 +2633,13 @@ async def queue_interval_set(message: Message, state: FSMContext):
 
 @router.message(F.text == "⚙️ Настройки")
 async def settings_menu(message: Message, state: FSMContext):
+    await state.clear()
     config = load_config()
     desc_enabled = config.get('features', {}).get('post_description', False)
-    desc_status = "✅ Вкл" if desc_enabled else "❌ Выкл"
-
+    from keyboards import settings_main_keyboard
     await message.answer(
-        f"⚙️ <b>Настройки</b>\n\n"
-        f"📝 Описание поста: <b>{desc_status}</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=f"📝 Описание постов: {desc_status}",
-                callback_data="settings:toggle_description"
-            )],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="settings:back")],
-        ]),
+        "⚙️ <b>Настройки</b>",
+        reply_markup=settings_main_keyboard(desc_enabled),
         parse_mode='HTML'
     )
 
@@ -2664,19 +2657,17 @@ async def settings_callback(callback: CallbackQuery, state: FSMContext):
         save_config(config)
 
         new_val = not current
-        desc_status = "✅ Вкл" if new_val else "❌ Выкл"
-        await callback.answer(f"📝 Описание постов: {desc_status}")
+        await callback.answer(f"📝 Описание постов: {'✅ Вкл' if new_val else '❌ Выкл'}")
+        from keyboards import settings_main_keyboard
+        await callback.message.edit_reply_markup(reply_markup=settings_main_keyboard(new_val))
+        return
 
+    if action == "categories":
+        await callback.answer()
+        from keyboards import category_editor_list_keyboard
         await callback.message.edit_text(
-            f"⚙️ <b>Настройки</b>\n\n"
-            f"📝 Описание поста: <b>{desc_status}</b>",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=f"📝 Описание постов: {desc_status}",
-                    callback_data="settings:toggle_description"
-                )],
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="settings:back")],
-            ]),
+            "📁 <b>Мои категории</b>\n\nВыберите категорию для редактирования или добавьте новую:",
+            reply_markup=category_editor_list_keyboard(callback.from_user.id),
             parse_mode='HTML'
         )
         return
@@ -2685,6 +2676,460 @@ async def settings_callback(callback: CallbackQuery, state: FSMContext):
         await callback.message.delete()
         await callback.message.answer("Выберите действие:", reply_markup=main_menu())
         return
+
+
+# ============ РЕДАКТОР КАТЕГОРИЙ ============
+
+def _get_category_platform(user_id: int, cat_key: str) -> str:
+    config = load_config()
+    for p_key, p_data in config.get('participants', {}).items():
+        if p_data.get('user_id') == user_id:
+            return p_data.get('categories', {}).get(cat_key, {}).get('platform', '')
+    return ''
+
+
+@router.callback_query(F.data.startswith("catedit:"))
+async def category_editor_callback(callback: CallbackQuery, state: FSMContext):
+    from keyboards import (category_editor_list_keyboard, category_edit_menu_keyboard,
+                           platform_select_keyboard, topic_select_keyboard, settings_main_keyboard)
+    parts = callback.data.split(":")
+    action = parts[1]
+    user_id = callback.from_user.id
+
+    # ── Список категорий ──────────────────────────────────────────────────────
+    if action == "back":
+        await callback.answer()
+        config = load_config()
+        desc_enabled = config.get('features', {}).get('post_description', False)
+        await callback.message.edit_text(
+            "⚙️ <b>Настройки</b>",
+            reply_markup=settings_main_keyboard(desc_enabled),
+            parse_mode='HTML'
+        )
+        return
+
+    if action == "list":
+        await callback.answer()
+        await callback.message.edit_text(
+            "📁 <b>Мои категории</b>\n\nВыберите категорию для редактирования или добавьте новую:",
+            reply_markup=category_editor_list_keyboard(user_id),
+            parse_mode='HTML'
+        )
+        return
+
+    # ── Открыть категорию ─────────────────────────────────────────────────────
+    if action == "open":
+        await callback.answer()
+        cat_key = parts[2]
+        config = load_config()
+        cat_data = None
+        for p_key, p_data in config.get('participants', {}).items():
+            if p_data.get('user_id') == user_id:
+                cat_data = p_data.get('categories', {}).get(cat_key)
+                break
+
+        if not cat_data:
+            await callback.answer("❌ Категория не найдена", show_alert=True)
+            return
+
+        platform_id = cat_data.get('platform', '')
+        platform_cfg = config.get('platforms', {}).get(platform_id, {})
+        plat_name = platform_cfg.get('name', platform_id)
+        plat_icon = "📡" if platform_cfg.get('type') == 'channel' else "👥"
+        topic_key = cat_data.get('topic')
+        topic_name = ""
+        if topic_key:
+            topic_name = platform_cfg.get('topics', {}).get(topic_key, {}).get('name', topic_key)
+        mode_str = " 🔗 (ссылки)" if cat_data.get('mode') == 'link_post' else ""
+
+        text = (
+            f"📁 <b>{cat_data['emoji']} {cat_data['name']}</b>{mode_str}\n\n"
+            f"{plat_icon} Платформа: <b>{plat_name}</b>\n"
+        )
+        if topic_name:
+            text += f"📌 Топик: <b>{topic_name}</b>\n"
+        text += f"✨ Эмодзи-строка: <b>{cat_data.get('emoji_row', '—')}</b>\n"
+        text += f"#️⃣ Хештегов: <b>{len(cat_data.get('hashtags', []))}</b>"
+
+        await callback.message.edit_text(
+            text,
+            reply_markup=category_edit_menu_keyboard(cat_key, platform_id),
+            parse_mode='HTML'
+        )
+        return
+
+    # ── Удалить категорию ─────────────────────────────────────────────────────
+    if action == "delete":
+        cat_key = parts[2]
+        config = load_config()
+        for p_key, p_data in config.get('participants', {}).items():
+            if p_data.get('user_id') == user_id:
+                cats = p_data.get('categories', {})
+                if cat_key in cats:
+                    del cats[cat_key]
+                    save_config(config)
+                    await callback.answer("🗑️ Категория удалена")
+                    await callback.message.edit_text(
+                        "📁 <b>Мои категории</b>",
+                        reply_markup=category_editor_list_keyboard(user_id),
+                        parse_mode='HTML'
+                    )
+                    return
+        await callback.answer("❌ Не найдено", show_alert=True)
+        return
+
+    # ── Начать добавление новой категории ─────────────────────────────────────
+    if action == "add":
+        await callback.answer()
+        await state.set_state(CategoryEditorFlow.adding_name)
+        await callback.message.answer(
+            "➕ <b>Добавление новой категории</b>\n\n"
+            "Введите <b>название</b> категории (например: Альтушки, Аниме):",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="❌ Отмена")]],
+                resize_keyboard=True
+            ),
+            parse_mode='HTML'
+        )
+        return
+
+    # ── Редактировать название ────────────────────────────────────────────────
+    if action == "edit_name":
+        cat_key = parts[2]
+        await state.set_state(CategoryEditorFlow.edit_name)
+        await state.update_data(editing_cat_key=cat_key)
+        await callback.answer()
+        await callback.message.answer(
+            "✏️ Введите новое <b>название</b> категории:",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="❌ Отмена")]],
+                resize_keyboard=True
+            ),
+            parse_mode='HTML'
+        )
+        return
+
+    # ── Редактировать эмодзи ──────────────────────────────────────────────────
+    if action == "edit_emoji":
+        cat_key = parts[2]
+        await state.set_state(CategoryEditorFlow.edit_emoji)
+        await state.update_data(editing_cat_key=cat_key)
+        await callback.answer()
+        await callback.message.answer(
+            "😀 Введите новый <b>эмодзи</b> категории (один символ, например: 🖤):",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="❌ Отмена")]],
+                resize_keyboard=True
+            ),
+            parse_mode='HTML'
+        )
+        return
+
+    # ── Редактировать строку эмодзи ───────────────────────────────────────────
+    if action == "edit_emoji_row":
+        cat_key = parts[2]
+        await state.set_state(CategoryEditorFlow.edit_emoji_row)
+        await state.update_data(editing_cat_key=cat_key)
+        await callback.answer()
+        await callback.message.answer(
+            "✨ Введите новую <b>строку эмодзи</b> (разделитель в постах):\n\n"
+            "Пример: <code>🖤💀🕷️🦇🌑🥀⛓️🗝️</code>",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="❌ Отмена")]],
+                resize_keyboard=True
+            ),
+            parse_mode='HTML'
+        )
+        return
+
+    # ── Редактировать платформу ───────────────────────────────────────────────
+    if action == "edit_platform":
+        cat_key = parts[2]
+        await state.update_data(editing_cat_key=cat_key)
+        await callback.answer()
+        await callback.message.edit_text(
+            "🔄 <b>Выберите платформу для категории:</b>",
+            reply_markup=platform_select_keyboard(cat_key),
+            parse_mode='HTML'
+        )
+        return
+
+    # ── Установить платформу ──────────────────────────────────────────────────
+    if action == "set_platform":
+        cat_key = parts[2]
+        new_platform = parts[3]
+        config = load_config()
+        platform_cfg = config.get('platforms', {}).get(new_platform, {})
+        has_topics = bool(platform_cfg.get('topics'))
+
+        # Если у платформы есть топики — спрашиваем топик
+        if has_topics:
+            await callback.answer()
+            await callback.message.edit_text(
+                "📌 <b>Выберите топик:</b>",
+                reply_markup=topic_select_keyboard(new_platform, cat_key),
+                parse_mode='HTML'
+            )
+            await state.update_data(pending_platform=new_platform, editing_cat_key=cat_key)
+        else:
+            # Канал без топиков — сразу сохраняем
+            for p_key, p_data in config.get('participants', {}).items():
+                if p_data.get('user_id') == user_id:
+                    cats = p_data.get('categories', {})
+                    if cat_key in cats:
+                        cats[cat_key]['platform'] = new_platform
+                        cats[cat_key].pop('topic', None)
+                        save_config(config)
+                        await callback.answer("✅ Платформа обновлена")
+                        cat_data = cats[cat_key]
+                        await callback.message.edit_text(
+                            f"✅ Платформа изменена на <b>{platform_cfg.get('name', new_platform)}</b>",
+                            reply_markup=category_edit_menu_keyboard(cat_key, new_platform),
+                            parse_mode='HTML'
+                        )
+                        return
+        return
+
+    # ── Установить топик ──────────────────────────────────────────────────────
+    if action == "set_topic":
+        cat_key = parts[2]
+        topic_key = parts[3]
+        data = await state.get_data()
+        new_platform = data.get('pending_platform') or _get_category_platform(user_id, cat_key)
+        config = load_config()
+
+        for p_key, p_data in config.get('participants', {}).items():
+            if p_data.get('user_id') == user_id:
+                cats = p_data.get('categories', {})
+                if cat_key in cats:
+                    cats[cat_key]['platform'] = new_platform
+                    if topic_key == '__none__':
+                        cats[cat_key].pop('topic', None)
+                    else:
+                        cats[cat_key]['topic'] = topic_key
+                    save_config(config)
+                    await callback.answer("✅ Сохранено")
+                    await callback.message.edit_text(
+                        f"✅ Платформа и топик обновлены",
+                        reply_markup=category_edit_menu_keyboard(cat_key, new_platform),
+                        parse_mode='HTML'
+                    )
+                    return
+
+    # ── Выбор платформы для новой категории ──────────────────────────────────
+    if action == "newplat":
+        new_platform = parts[2]
+        config = load_config()
+        platform_cfg = config.get('platforms', {}).get(new_platform, {})
+        has_topics = bool(platform_cfg.get('topics'))
+        await state.update_data(new_cat_platform=new_platform)
+
+        if has_topics:
+            await callback.answer()
+            await callback.message.edit_text(
+                "📌 <b>Выберите топик для новой категории:</b>",
+                reply_markup=topic_select_keyboard(new_platform),
+                parse_mode='HTML'
+            )
+        else:
+            # Канал — создаём категорию без топика
+            await state.set_state(CategoryEditorFlow.adding_topic)
+            await _finalize_new_category(callback, state, user_id, topic_key=None)
+        return
+
+    # ── Выбор топика для новой категории ─────────────────────────────────────
+    if action == "newtopic":
+        topic_key = None if parts[2] == '__none__' else parts[2]
+        await _finalize_new_category(callback, state, user_id, topic_key=topic_key)
+        return
+
+    await callback.answer()
+
+
+async def _finalize_new_category(callback, state: FSMContext, user_id: int, topic_key):
+    """Сохраняет новую категорию после выбора платформы и топика."""
+    from keyboards import category_editor_list_keyboard
+    data = await state.get_data()
+    new_cat_name = data.get('new_cat_name', 'Новая')
+    new_cat_emoji = data.get('new_cat_emoji', '📁')
+    new_cat_emoji_row = data.get('new_cat_emoji_row', '')
+    new_cat_platform = data.get('new_cat_platform', '')
+
+    # Генерируем ключ
+    import re
+    cat_key = re.sub(r'[^a-zA-Z0-9_]', '', new_cat_name.lower().replace(' ', '_'))[:20]
+    if not cat_key:
+        cat_key = f"cat_{user_id % 1000}"
+
+    config = load_config()
+    for p_key, p_data in config.get('participants', {}).items():
+        if p_data.get('user_id') == user_id:
+            cats = p_data.get('categories', {})
+            # Если такой ключ уже есть — добавляем суффикс
+            base_key = cat_key
+            i = 2
+            while cat_key in cats:
+                cat_key = f"{base_key}_{i}"
+                i += 1
+            cats[cat_key] = {
+                'name': new_cat_name,
+                'emoji': new_cat_emoji,
+                'emoji_row': new_cat_emoji_row,
+                'platform': new_cat_platform,
+                'hashtags': [],
+            }
+            if topic_key:
+                cats[cat_key]['topic'] = topic_key
+            save_config(config)
+            await state.clear()
+            await callback.answer("✅ Категория создана!")
+            await callback.message.edit_text(
+                f"✅ Категория <b>{new_cat_emoji} {new_cat_name}</b> добавлена!\n\n"
+                "Теперь добавьте хештеги через 📁 Создать пост → нужная категория → ➕ Свой хештег",
+                reply_markup=category_editor_list_keyboard(user_id),
+                parse_mode='HTML'
+            )
+            return
+
+    await callback.answer("❌ Ошибка", show_alert=True)
+
+
+# ── Handlers для ввода текста в редакторе категорий ───────────────────────────
+
+@router.message(CategoryEditorFlow.adding_name)
+async def catedit_adding_name(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Выберите действие:", reply_markup=main_menu())
+        return
+    await state.update_data(new_cat_name=message.text.strip())
+    await state.set_state(CategoryEditorFlow.adding_emoji)
+    await message.answer(
+        "😀 Введите <b>эмодзи</b> для категории (один символ, например: 🖤 🎮 🌸):",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True),
+        parse_mode='HTML'
+    )
+
+
+@router.message(CategoryEditorFlow.adding_emoji)
+async def catedit_adding_emoji(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Выберите действие:", reply_markup=main_menu())
+        return
+    await state.update_data(new_cat_emoji=message.text.strip())
+    await state.set_state(CategoryEditorFlow.adding_emoji_row)
+    await message.answer(
+        "✨ Введите <b>строку эмодзи</b> — декоративный разделитель в постах:\n\n"
+        "Пример: <code>🖤💀🕷️🦇🌑🥀⛓️🗝️</code>\n\n"
+        "Или отправьте <code>-</code> чтобы пропустить",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True),
+        parse_mode='HTML'
+    )
+
+
+@router.message(CategoryEditorFlow.adding_emoji_row)
+async def catedit_adding_emoji_row(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Выберите действие:", reply_markup=main_menu())
+        return
+    emoji_row = "" if message.text.strip() == "-" else message.text.strip()
+    await state.update_data(new_cat_emoji_row=emoji_row)
+    await state.set_state(CategoryEditorFlow.adding_platform)
+
+    from keyboards import platform_select_keyboard
+    await message.answer(
+        "📡 <b>Выберите платформу для публикации:</b>",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Отмена")]], resize_keyboard=True),
+        parse_mode='HTML'
+    )
+    await message.answer(
+        "👇 Нажмите на платформу:",
+        reply_markup=platform_select_keyboard()
+    )
+
+
+@router.message(CategoryEditorFlow.edit_name)
+async def catedit_edit_name(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Выберите действие:", reply_markup=main_menu())
+        return
+    data = await state.get_data()
+    cat_key = data.get('editing_cat_key')
+    config = load_config()
+    for p_key, p_data in config.get('participants', {}).items():
+        if p_data.get('user_id') == message.from_user.id:
+            cats = p_data.get('categories', {})
+            if cat_key in cats:
+                cats[cat_key]['name'] = message.text.strip()
+                save_config(config)
+                await state.clear()
+                from keyboards import category_edit_menu_keyboard
+                await message.answer(
+                    f"✅ Название изменено на <b>{message.text.strip()}</b>",
+                    reply_markup=category_edit_menu_keyboard(cat_key, cats[cat_key]['platform']),
+                    parse_mode='HTML'
+                )
+                return
+    await message.answer("❌ Ошибка", reply_markup=main_menu())
+    await state.clear()
+
+
+@router.message(CategoryEditorFlow.edit_emoji)
+async def catedit_edit_emoji(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Выберите действие:", reply_markup=main_menu())
+        return
+    data = await state.get_data()
+    cat_key = data.get('editing_cat_key')
+    config = load_config()
+    for p_key, p_data in config.get('participants', {}).items():
+        if p_data.get('user_id') == message.from_user.id:
+            cats = p_data.get('categories', {})
+            if cat_key in cats:
+                cats[cat_key]['emoji'] = message.text.strip()
+                save_config(config)
+                await state.clear()
+                from keyboards import category_edit_menu_keyboard
+                await message.answer(
+                    f"✅ Эмодзи изменён на <b>{message.text.strip()}</b>",
+                    reply_markup=category_edit_menu_keyboard(cat_key, cats[cat_key]['platform']),
+                    parse_mode='HTML'
+                )
+                return
+    await message.answer("❌ Ошибка", reply_markup=main_menu())
+    await state.clear()
+
+
+@router.message(CategoryEditorFlow.edit_emoji_row)
+async def catedit_edit_emoji_row(message: Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Выберите действие:", reply_markup=main_menu())
+        return
+    data = await state.get_data()
+    cat_key = data.get('editing_cat_key')
+    new_row = "" if message.text.strip() == "-" else message.text.strip()
+    config = load_config()
+    for p_key, p_data in config.get('participants', {}).items():
+        if p_data.get('user_id') == message.from_user.id:
+            cats = p_data.get('categories', {})
+            if cat_key in cats:
+                cats[cat_key]['emoji_row'] = new_row
+                save_config(config)
+                await state.clear()
+                from keyboards import category_edit_menu_keyboard
+                await message.answer(
+                    f"✅ Строка эмодзи обновлена",
+                    reply_markup=category_edit_menu_keyboard(cat_key, cats[cat_key]['platform']),
+                    parse_mode='HTML'
+                )
+                return
+    await message.answer("❌ Ошибка", reply_markup=main_menu())
+    await state.clear()
 
 
 # ============ ОЧИСТКА ЧАТА ============
