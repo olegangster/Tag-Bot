@@ -657,6 +657,7 @@ def settings_main_keyboard(desc_enabled: bool) -> InlineKeyboardMarkup:
 # ============ РЕДАКТОР КАТЕГОРИЙ ============
 
 def category_editor_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Список категорий пользователя с иконкой платформы."""
     config = load_config()
     rows = []
     for p_key, p_data in config.get("participants", {}).items():
@@ -664,9 +665,15 @@ def category_editor_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
             for cat_key, cat in p_data.get("categories", {}).items():
                 platform_id = cat.get("platform", "")
                 platform_cfg = config.get("platforms", {}).get(platform_id, {})
-                plat_icon = "📡" if platform_cfg.get("type") == "channel" else "👥"
+                plat_type = platform_cfg.get("type", "group")
+                plat_icon = "📡" if plat_type == "channel" else "👥"
+                topic_key = cat.get("topic")
+                topic_name = ""
+                if topic_key:
+                    topic_name = platform_cfg.get("topics", {}).get(topic_key, {}).get("name", "")
+                topic_str = f" › {topic_name}" if topic_name else ""
                 rows.append([InlineKeyboardButton(
-                    text=f"{cat['emoji']} {cat['name']} {plat_icon}",
+                    text=f"{cat['emoji']} {cat['name']} {plat_icon}{topic_str}",
                     callback_data=f"catedit:open:{cat_key}"
                 )])
             break
@@ -676,24 +683,44 @@ def category_editor_list_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def category_edit_menu_keyboard(cat_key: str, platform_id: str) -> InlineKeyboardMarkup:
+    """Меню редактирования категории с явным переключателем платформы."""
     config = load_config()
     platform_cfg = config.get("platforms", {}).get(platform_id, {})
     plat_name = platform_cfg.get("name", platform_id)
-    plat_icon = "📡" if platform_cfg.get("type") == "channel" else "👥"
-    return InlineKeyboardMarkup(inline_keyboard=[
+    plat_type = platform_cfg.get("type", "group")
+    plat_icon = "📡" if plat_type == "channel" else "👥"
+
+    # Показываем альтернативные платформы как кнопки переключения
+    switch_rows = []
+    for other_id, other_cfg in config.get("platforms", {}).items():
+        if other_id == platform_id:
+            continue
+        other_icon = "📡" if other_cfg.get("type") == "channel" else "👥"
+        other_name = other_cfg.get("name", other_id)
+        switch_rows.append(InlineKeyboardButton(
+            text=f"↔️ Переключить на {other_icon} {other_name}",
+            callback_data=f"catedit:set_platform:{cat_key}:{other_id}"
+        ))
+
+    rows = [
         [InlineKeyboardButton(text="✏️ Название", callback_data=f"catedit:edit_name:{cat_key}"),
          InlineKeyboardButton(text="😀 Эмодзи", callback_data=f"catedit:edit_emoji:{cat_key}")],
         [InlineKeyboardButton(text="✨ Строка эмодзи", callback_data=f"catedit:edit_emoji_row:{cat_key}")],
         [InlineKeyboardButton(
-            text=f"{plat_icon} Платформа: {plat_name}",
-            callback_data=f"catedit:edit_platform:{cat_key}"
+            text=f"{plat_icon} Сейчас: {plat_name} — сменить топик",
+            callback_data=f"catedit:edit_topic:{cat_key}"
         )],
-        [InlineKeyboardButton(text="🗑️ Удалить категорию", callback_data=f"catedit:delete:{cat_key}")],
-        [InlineKeyboardButton(text="🔙 К списку", callback_data="catedit:list")],
-    ])
+    ]
+    # Кнопки переключения на другие платформы (по одной на строку)
+    for btn in switch_rows:
+        rows.append([btn])
+    rows.append([InlineKeyboardButton(text="🗑️ Удалить категорию", callback_data=f"catedit:delete:{cat_key}")])
+    rows.append([InlineKeyboardButton(text="🔙 К списку", callback_data="catedit:list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def platform_select_keyboard(cat_key: str = None) -> InlineKeyboardMarkup:
+    """Выбор платформы (для создания новой категории)."""
     config = load_config()
     rows = []
     for plat_id, plat_data in config.get("platforms", {}).items():
@@ -708,6 +735,7 @@ def platform_select_keyboard(cat_key: str = None) -> InlineKeyboardMarkup:
 
 
 def topic_select_keyboard(platform_id: str, cat_key: str = None) -> InlineKeyboardMarkup:
+    """Выбор топика для группы."""
     config = load_config()
     platform_cfg = config.get("platforms", {}).get(platform_id, {})
     topics = platform_cfg.get("topics", {})
@@ -716,12 +744,37 @@ def topic_select_keyboard(platform_id: str, cat_key: str = None) -> InlineKeyboa
         cb = (f"catedit:set_topic:{cat_key}:{topic_key}"
               if cat_key else f"catedit:newtopic:{topic_key}")
         rows.append([InlineKeyboardButton(
-            text=f"#{topic_data.get('name', topic_key)}",
+            text=f"📌 {topic_data.get('name', topic_key)}",
             callback_data=cb
         )])
     rows.append([InlineKeyboardButton(
-        text="— Без топика",
+        text="— Без топика (общий чат)",
         callback_data=f"catedit:set_topic:{cat_key}:__none__" if cat_key else "catedit:newtopic:__none__"
     )])
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="catedit:list")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"catedit:open:{cat_key}" if cat_key else "catedit:list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def add_category_type_keyboard() -> InlineKeyboardMarkup:
+    """Первый шаг добавления категории: выбор откуда взять (шаблон из конфига или создать с нуля)."""
+    config = load_config()
+    rows = []
+    # Собираем уникальные топики из всех платформ как "быстрые шаблоны"
+    for plat_id, plat_data in config.get("platforms", {}).items():
+        plat_icon = "📡" if plat_data.get("type") == "channel" else "👥"
+        plat_name = plat_data.get("name", plat_id)
+        topics = plat_data.get("topics", {})
+        if topics:
+            for topic_key, topic_data in topics.items():
+                rows.append([InlineKeyboardButton(
+                    text=f"{plat_icon} {plat_name} › 📌 {topic_data.get('name', topic_key)}",
+                    callback_data=f"catedit:quickadd:{plat_id}:{topic_key}"
+                )])
+        else:
+            rows.append([InlineKeyboardButton(
+                text=f"{plat_icon} {plat_name}",
+                callback_data=f"catedit:quickadd:{plat_id}:__none__"
+            )])
+    rows.append([InlineKeyboardButton(text="✏️ Создать вручную", callback_data="catedit:add_manual")])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="catedit:list")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
