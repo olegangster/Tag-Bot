@@ -50,8 +50,11 @@ def categories_keyboard(user_id: int) -> ReplyKeyboardMarkup:
     for participant_key, data in config.get("participants", {}).items():
         if data.get("user_id") == user_id:
             cats = data.get("categories", {})
+            active_keys = data.get("active_categories")  # None = все категории
             row = []
             for cat_key, cat in cats.items():
+                if active_keys is not None and cat_key not in active_keys:
+                    continue
                 label = f"{cat['emoji']} {cat['name']}"
                 row.append(KeyboardButton(text=label))
                 if len(row) == 2:
@@ -650,8 +653,69 @@ def settings_main_keyboard(desc_enabled: bool) -> InlineKeyboardMarkup:
             callback_data="settings:toggle_description"
         )],
         [InlineKeyboardButton(text="📁 Редактор категорий", callback_data="settings:categories")],
+        [InlineKeyboardButton(text="🎯 Активные категории", callback_data="settings:active_cats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="settings:back")],
     ])
+
+
+# ============ АКТИВНЫЕ КАТЕГОРИИ ============
+
+def active_cats_platform_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Выбор платформы для настройки активных категорий."""
+    config = load_config()
+    rows = []
+    for plat_id, plat_data in config.get("platforms", {}).items():
+        plat_icon = "📡" if plat_data.get("type") == "channel" else "👥"
+        plat_name = plat_data.get("name", plat_id)
+        rows.append([InlineKeyboardButton(
+            text=f"{plat_icon} {plat_name}",
+            callback_data=f"activecats:platform:{plat_id}"
+        )])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="activecats:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def active_cats_select_keyboard(user_id: int, platform_id: str) -> InlineKeyboardMarkup:
+    """
+    Список категорий пользователя на выбранной платформе.
+    Нажатие переключает активность категории.
+    """
+    config = load_config()
+
+    # Получаем текущие активные ключи
+    active_keys = None
+    for p_key, p_data in config.get("participants", {}).items():
+        if p_data.get("user_id") == user_id:
+            active_keys = p_data.get("active_categories")  # None = все активны
+            break
+
+    rows = []
+    found_any = False
+    for p_key, p_data in config.get("participants", {}).items():
+        if p_data.get("user_id") != user_id:
+            continue
+        for cat_key, cat in p_data.get("categories", {}).items():
+            if cat.get("platform") != platform_id:
+                continue
+            found_any = True
+            # Если active_keys is None — все включены по умолчанию
+            is_active = (active_keys is None) or (cat_key in active_keys)
+            check = "✅" if is_active else "☑️"
+            rows.append([InlineKeyboardButton(
+                text=f"{check} {cat['emoji']} {cat['name']}",
+                callback_data=f"activecats:toggle:{platform_id}:{cat_key}"
+            )])
+        break
+
+    if not found_any:
+        rows.append([InlineKeyboardButton(text="📭 Нет категорий на этой платформе", callback_data="activecats:noop")])
+
+    rows.append([InlineKeyboardButton(text="✅ Включить все", callback_data=f"activecats:all:{platform_id}")])
+    rows.append([
+        InlineKeyboardButton(text="💾 Сохранить", callback_data=f"activecats:save:{platform_id}"),
+        InlineKeyboardButton(text="🔙 Назад", callback_data="activecats:platforms"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ============ РЕДАКТОР КАТЕГОРИЙ ============
