@@ -2684,6 +2684,28 @@ async def settings_callback(callback: CallbackQuery, state: FSMContext):
         )
         return
 
+    if action == "catalog":
+        from category_catalog import catalog_keyboard
+        await callback.answer()
+        await callback.message.edit_text(
+            "🗂️ <b>Каталог категорий</b>
+
+"
+            "Здесь собраны все доступные категории.
+"
+            "➕ — добавить категорию себе
+"
+            "✅ / 🗑️ — категория уже есть (нажмите 🗑️ чтобы удалить)
+
+"
+            "Категории публикуются на указанную платформу/топик.
+"
+            "Вы всегда сможете изменить настройки через <b>Редактор категорий</b>.",
+            reply_markup=catalog_keyboard(callback.from_user.id),
+            parse_mode="HTML"
+        )
+        return
+
     if action == "back":
         await callback.message.delete()
         await callback.message.answer("Выберите действие:", reply_markup=main_menu())
@@ -2814,6 +2836,92 @@ async def active_categories_callback(callback: CallbackQuery, state: FSMContext)
     if action == "noop":
         await callback.answer()
         return
+
+
+# ============ КАТАЛОГ КАТЕГОРИЙ ============
+
+@router.callback_query(F.data == "settings:catalog")
+async def settings_catalog(callback: CallbackQuery, state: FSMContext):
+    """Открывает каталог всех доступных категорий."""
+    from category_catalog import catalog_keyboard
+    await callback.answer()
+    await callback.message.edit_text(
+        "🗂️ <b>Каталог категорий</b>\n\n"
+        "Здесь собраны все доступные категории.\n"
+        "➕ — добавить категорию себе\n"
+        "✅ / 🗑️ — категория уже есть (нажмите 🗑️ чтобы удалить)\n\n"
+        "Категории публикуются на указанную платформу/топик.\n"
+        "Вы всегда сможете изменить настройки через <b>Редактор категорий</b>.",
+        reply_markup=catalog_keyboard(callback.from_user.id),
+        parse_mode='HTML'
+    )
+
+
+@router.callback_query(F.data.startswith("catcatalog:"))
+async def category_catalog_callback(callback: CallbackQuery, state: FSMContext):
+    from category_catalog import catalog_keyboard, add_category_to_user, remove_category_from_user
+    from keyboards import settings_main_keyboard
+
+    parts = callback.data.split(":")
+    action = parts[1]
+    user_id = callback.from_user.id
+
+    if action == "noop":
+        await callback.answer()
+        return
+
+    # Добавить категорию из каталога
+    if action == "add":
+        catalog_uid = parts[2]
+        success, msg = add_category_to_user(user_id, catalog_uid)
+        await callback.answer(
+            "✅ Добавлено!" if success else "⚠️ Уже есть",
+            show_alert=not success
+        )
+        # Обновляем список
+        await callback.message.edit_text(
+            "🗂️ <b>Каталог категорий</b>\n\n"
+            f"{msg}\n\n"
+            "➕ — добавить  |  🗑️ — удалить",
+            reply_markup=catalog_keyboard(user_id),
+            parse_mode='HTML'
+        )
+        return
+
+    # Удалить категорию пользователя
+    if action == "remove":
+        cat_key = parts[2]
+        success, msg = remove_category_from_user(user_id, cat_key)
+        await callback.answer(
+            "🗑️ Удалено" if success else "❌ Ошибка",
+            show_alert=not success
+        )
+        await callback.message.edit_text(
+            "🗂️ <b>Каталог категорий</b>\n\n"
+            f"{msg}\n\n"
+            "➕ — добавить  |  🗑️ — удалить",
+            reply_markup=catalog_keyboard(user_id),
+            parse_mode='HTML'
+        )
+        return
+
+    # Фильтр по платформе
+    if action == "filter":
+        platform_id = None if parts[2] == "all" else parts[2]
+        await callback.answer()
+        await callback.message.edit_text(
+            "🗂️ <b>Каталог категорий</b>\n\n"
+            "➕ — добавить  |  🗑️ — удалить",
+            reply_markup=catalog_keyboard(user_id, filter_platform=platform_id),
+            parse_mode='HTML'
+        )
+        return
+
+    # Инфо об уже добавленной категории
+    if action == "info":
+        await callback.answer("✅ Эта категория уже есть у вас", show_alert=True)
+        return
+
 
 # ============ РЕДАКТОР КАТЕГОРИЙ ============
 
