@@ -653,6 +653,7 @@ def settings_main_keyboard(desc_enabled: bool) -> InlineKeyboardMarkup:
             callback_data="settings:toggle_description"
         )],
         [InlineKeyboardButton(text="📁 Редактор категорий", callback_data="settings:categories")],
+        [InlineKeyboardButton(text="🗂️ Каталог категорий", callback_data="settings:catalog")],
         [InlineKeyboardButton(text="🎯 Активные категории", callback_data="settings:active_cats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="settings:back")],
     ])
