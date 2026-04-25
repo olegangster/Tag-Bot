@@ -2674,12 +2674,13 @@ async def settings_callback(callback: CallbackQuery, state: FSMContext):
 
     if action == "active_cats":
         await callback.answer()
-        from keyboards import active_cats_platform_keyboard
+        from keyboards import active_cats_keyboard
         await callback.message.edit_text(
             "🎯 <b>Активные категории</b>\n\n"
-            "Выберите платформу, чтобы настроить какие категории\n"
-            "отображаются при создании поста или пакетной отправки:",
-            reply_markup=active_cats_platform_keyboard(callback.from_user.id),
+            "Переключайтесь между платформами кнопками вверху.\n"
+            "✅ — отображается при создании поста  |  ☑️ — скрыта\n\n"
+            "Нажмите <b>💾 Сохранить</b> чтобы применить изменения.",
+            reply_markup=active_cats_keyboard(callback.from_user.id),
             parse_mode='HTML'
         )
         return
@@ -2688,18 +2689,11 @@ async def settings_callback(callback: CallbackQuery, state: FSMContext):
         from category_catalog import catalog_keyboard
         await callback.answer()
         await callback.message.edit_text(
-            "🗂️ <b>Каталог категорий</b>
-
-"
-            "Здесь собраны все доступные категории.
-"
-            "➕ — добавить категорию себе
-"
-            "✅ / 🗑️ — категория уже есть (нажмите 🗑️ чтобы удалить)
-
-"
-            "Категории публикуются на указанную платформу/топик.
-"
+            "🗂️ <b>Каталог категорий</b>\n\n"
+            "Здесь собраны все доступные категории.\n"
+            "➕ — добавить категорию себе\n"
+            "✅ / 🗑️ — категория уже есть (нажмите 🗑️ чтобы удалить)\n\n"
+            "Категории публикуются на указанную платформу/топик.\n"
             "Вы всегда сможете изменить настройки через <b>Редактор категорий</b>.",
             reply_markup=catalog_keyboard(callback.from_user.id),
             parse_mode="HTML"
@@ -2714,14 +2708,22 @@ async def settings_callback(callback: CallbackQuery, state: FSMContext):
 
 # ============ АКТИВНЫЕ КАТЕГОРИИ ============
 
+_ACTIVECATS_HEADER = (
+    "🎯 <b>Активные категории</b>\n\n"
+    "Переключайтесь между платформами кнопками вверху.\n"
+    "✅ — отображается при создании поста  |  ☑️ — скрыта\n\n"
+    "Нажмите <b>💾 Сохранить</b> чтобы применить изменения."
+)
+
+
 @router.callback_query(F.data.startswith("activecats:"))
 async def active_categories_callback(callback: CallbackQuery, state: FSMContext):
-    from keyboards import (active_cats_platform_keyboard, active_cats_select_keyboard,
-                           settings_main_keyboard)
+    from keyboards import active_cats_keyboard, settings_main_keyboard
     parts = callback.data.split(":")
     action = parts[1]
     user_id = callback.from_user.id
 
+    # ── Назад в настройки ────────────────────────────────────────────────────
     if action == "back":
         await callback.answer()
         config = load_config()
@@ -2733,54 +2735,61 @@ async def active_categories_callback(callback: CallbackQuery, state: FSMContext)
         )
         return
 
-    if action == "platforms":
-        await callback.answer()
-        await callback.message.edit_text(
-            "🎯 <b>Активные категории</b>\n\nВыберите платформу:",
-            reply_markup=active_cats_platform_keyboard(user_id),
-            parse_mode='HTML'
-        )
-        return
-
-    if action == "platform":
+    # ── Переключение платформы (inline-таб) ───────────────────────────────────
+    if action == "switch":
         await callback.answer()
         platform_id = parts[2]
-        config = load_config()
-        plat_name = config.get('platforms', {}).get(platform_id, {}).get('name', platform_id)
         await callback.message.edit_text(
-            f"🎯 <b>Категории — {plat_name}</b>\n\n"
-            "Нажмите на категорию чтобы включить или выключить её.\n"
-            "✅ — отображается при создании поста\n"
-            "☑️ — скрыта",
-            reply_markup=active_cats_select_keyboard(user_id, platform_id),
+            _ACTIVECATS_HEADER,
+            reply_markup=active_cats_keyboard(user_id, platform_id),
             parse_mode='HTML'
         )
         return
 
+    # ── Алиасы старых action для обратной совместимости ──────────────────────
+    if action in ("platforms", "platform"):
+        await callback.answer()
+        platform_id = parts[2] if action == "platform" and len(parts) > 2 else None
+        await callback.message.edit_text(
+            _ACTIVECATS_HEADER,
+            reply_markup=active_cats_keyboard(user_id, platform_id),
+            parse_mode='HTML'
+        )
+        return
+
+    # ── Тоггл категории ───────────────────────────────────────────────────────
     if action == "toggle":
         platform_id = parts[2]
         cat_key = parts[3]
         config = load_config()
 
+        toggled_on = False
         for p_key, p_data in config.get('participants', {}).items():
             if p_data.get('user_id') == user_id:
                 cats = p_data.get('categories', {})
                 if 'active_categories' not in p_data:
+                    # Первое изменение — инициализируем все ключи как активные
                     p_data['active_categories'] = list(cats.keys())
                 active = p_data['active_categories']
                 if cat_key in active:
                     active.remove(cat_key)
+                    toggled_on = False
                 else:
                     active.append(cat_key)
+                    toggled_on = True
                 save_config(config)
                 break
 
-        await callback.answer()
-        await callback.message.edit_reply_markup(
-            reply_markup=active_cats_select_keyboard(user_id, platform_id)
-        )
+        await callback.answer("✅ Включено" if toggled_on else "☑️ Скрыто")
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=active_cats_keyboard(user_id, platform_id)
+            )
+        except Exception:
+            pass
         return
 
+    # ── Включить все на платформе ─────────────────────────────────────────────
     if action == "all":
         platform_id = parts[2]
         config = load_config()
@@ -2789,7 +2798,7 @@ async def active_categories_callback(callback: CallbackQuery, state: FSMContext)
                 cats = p_data.get('categories', {})
                 current_active = p_data.get('active_categories')
                 if current_active is None:
-                    await callback.answer("✅ Все категории уже активны")
+                    await callback.answer("✅ Все уже активны")
                     return
                 for ck, cd in cats.items():
                     if cd.get('platform') == platform_id and ck not in current_active:
@@ -2798,11 +2807,15 @@ async def active_categories_callback(callback: CallbackQuery, state: FSMContext)
                 break
 
         await callback.answer("✅ Все включены")
-        await callback.message.edit_reply_markup(
-            reply_markup=active_cats_select_keyboard(user_id, platform_id)
-        )
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=active_cats_keyboard(user_id, platform_id)
+            )
+        except Exception:
+            pass
         return
 
+    # ── Сохранить ─────────────────────────────────────────────────────────────
     if action == "save":
         platform_id = parts[2]
         config = load_config()
@@ -2814,7 +2827,7 @@ async def active_categories_callback(callback: CallbackQuery, state: FSMContext)
                 active_keys = p_data.get('active_categories')
                 cats = p_data.get('categories', {})
                 if active_keys is None:
-                    active_count = len(cats)
+                    active_count = sum(1 for cd in cats.values() if cd.get('platform') == platform_id)
                 else:
                     active_count = sum(
                         1 for ck, cd in cats.items()
@@ -2823,16 +2836,16 @@ async def active_categories_callback(callback: CallbackQuery, state: FSMContext)
                 break
 
         await callback.answer(f"✅ Сохранено! Активно: {active_count} кат.")
+        # Остаёмся на той же странице, показываем подтверждение в тексте
         await callback.message.edit_text(
-            f"✅ <b>Настройки сохранены</b>\n\n"
-            f"📍 Платформа: <b>{plat_name}</b>\n"
-            f"📂 Активных категорий: <b>{active_count}</b>\n\n"
-            "Теперь при создании поста будут показаны только выбранные категории.",
-            reply_markup=active_cats_platform_keyboard(user_id),
+            f"✅ <b>Сохранено</b> — {plat_name}: активных категорий <b>{active_count}</b>\n\n"
+            + _ACTIVECATS_HEADER[_ACTIVECATS_HEADER.index("\n\n")+2:],  # убираем заголовок, оставляем подсказки
+            reply_markup=active_cats_keyboard(user_id, platform_id),
             parse_mode='HTML'
         )
         return
 
+    # ── Заглушка ──────────────────────────────────────────────────────────────
     if action == "noop":
         await callback.answer()
         return
