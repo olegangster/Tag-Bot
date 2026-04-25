@@ -661,62 +661,100 @@ def settings_main_keyboard(desc_enabled: bool) -> InlineKeyboardMarkup:
 
 # ============ АКТИВНЫЕ КАТЕГОРИИ ============
 
-def active_cats_platform_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Выбор платформы для настройки активных категорий."""
+def active_cats_keyboard(user_id: int, selected_platform_id: Optional[str] = None) -> InlineKeyboardMarkup:
+    """
+    Единая страница «Активные категории»:
+    — Вверху: переключатель платформ (канал / группа / ...) — выбранная подсвечена ✦
+    — Ниже: галочки категорий выбранной платформы
+    — Внизу: «✅ Включить все», «💾 Сохранить», «🔙 Назад»
+    """
     config = load_config()
-    rows = []
-    for plat_id, plat_data in config.get("platforms", {}).items():
+    platforms = config.get("platforms", {})
+
+    # Если платформа не задана — берём первую
+    if selected_platform_id is None or selected_platform_id not in platforms:
+        selected_platform_id = next(iter(platforms), None)
+
+    # ── Строка переключателей платформ ──────────────────────────────────────
+    plat_row = []
+    for plat_id, plat_data in platforms.items():
         plat_icon = "📡" if plat_data.get("type") == "channel" else "👥"
         plat_name = plat_data.get("name", plat_id)
-        rows.append([InlineKeyboardButton(
-            text=f"{plat_icon} {plat_name}",
-            callback_data=f"activecats:platform:{plat_id}"
-        )])
-    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="activecats:back")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        if plat_id == selected_platform_id:
+            label = f"【{plat_icon} {plat_name}】"   # активная платформа выделена
+        else:
+            label = f"{plat_icon} {plat_name}"
+        plat_row.append(InlineKeyboardButton(
+            text=label,
+            callback_data=f"activecats:switch:{plat_id}"
+        ))
 
+    rows = [plat_row] if plat_row else []
 
-def active_cats_select_keyboard(user_id: int, platform_id: str) -> InlineKeyboardMarkup:
-    """
-    Список категорий пользователя на выбранной платформе.
-    Нажатие переключает активность категории.
-    """
-    config = load_config()
+    # ── Разделитель-заголовок ────────────────────────────────────────────────
+    platform_cfg = platforms.get(selected_platform_id, {})
+    plat_type = platform_cfg.get("type", "group")
+    plat_name_full = platform_cfg.get("name", selected_platform_id)
+    plat_icon_full = "📡" if plat_type == "channel" else "👥"
+    rows.append([InlineKeyboardButton(
+        text=f"── {plat_icon_full} {plat_name_full} ──",
+        callback_data="activecats:noop"
+    )])
 
-    # Получаем текущие активные ключи
-    active_keys = None
+    # ── Получаем active_categories пользователя ──────────────────────────────
+    active_keys: Optional[list] = None
+    user_cats: dict = {}
     for p_key, p_data in config.get("participants", {}).items():
         if p_data.get("user_id") == user_id:
             active_keys = p_data.get("active_categories")  # None = все активны
+            user_cats = p_data.get("categories", {})
             break
 
-    rows = []
+    # ── Категории выбранной платформы ────────────────────────────────────────
     found_any = False
-    for p_key, p_data in config.get("participants", {}).items():
-        if p_data.get("user_id") != user_id:
+    for cat_key, cat in user_cats.items():
+        if cat.get("platform") != selected_platform_id:
             continue
-        for cat_key, cat in p_data.get("categories", {}).items():
-            if cat.get("platform") != platform_id:
-                continue
-            found_any = True
-            # Если active_keys is None — все включены по умолчанию
-            is_active = (active_keys is None) or (cat_key in active_keys)
-            check = "✅" if is_active else "☑️"
-            rows.append([InlineKeyboardButton(
-                text=f"{check} {cat['emoji']} {cat['name']}",
-                callback_data=f"activecats:toggle:{platform_id}:{cat_key}"
-            )])
-        break
+        found_any = True
+        is_active = (active_keys is None) or (cat_key in active_keys)
+        check = "✅" if is_active else "☑️"
+        topic_key = cat.get("topic")
+        topic_name = ""
+        if topic_key:
+            topic_name = platform_cfg.get("topics", {}).get(topic_key, {}).get("name", "")
+        topic_str = f" › {topic_name}" if topic_name else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{check} {cat['emoji']} {cat['name']}{topic_str}",
+            callback_data=f"activecats:toggle:{selected_platform_id}:{cat_key}"
+        )])
 
     if not found_any:
-        rows.append([InlineKeyboardButton(text="📭 Нет категорий на этой платформе", callback_data="activecats:noop")])
+        rows.append([InlineKeyboardButton(
+            text="📭 Нет категорий на этой платформе",
+            callback_data="activecats:noop"
+        )])
 
-    rows.append([InlineKeyboardButton(text="✅ Включить все", callback_data=f"activecats:all:{platform_id}")])
+    # ── Управляющие кнопки ───────────────────────────────────────────────────
+    rows.append([InlineKeyboardButton(
+        text="✅ Включить все на этой платформе",
+        callback_data=f"activecats:all:{selected_platform_id}"
+    )])
     rows.append([
-        InlineKeyboardButton(text="💾 Сохранить", callback_data=f"activecats:save:{platform_id}"),
-        InlineKeyboardButton(text="🔙 Назад", callback_data="activecats:platforms"),
+        InlineKeyboardButton(text="💾 Сохранить", callback_data=f"activecats:save:{selected_platform_id}"),
+        InlineKeyboardButton(text="🔙 Назад", callback_data="activecats:back"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Оставляем алиасы для обратной совместимости (если где-то импортируются)
+def active_cats_platform_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Алиас — открывает единую страницу с первой платформой."""
+    return active_cats_keyboard(user_id)
+
+
+def active_cats_select_keyboard(user_id: int, platform_id: str) -> InlineKeyboardMarkup:
+    """Алиас — открывает единую страницу с конкретной платформой."""
+    return active_cats_keyboard(user_id, platform_id)
 
 
 # ============ РЕДАКТОР КАТЕГОРИЙ ============
