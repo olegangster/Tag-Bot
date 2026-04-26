@@ -52,26 +52,43 @@ def get_user_cat_keys(config: dict, user_id: int) -> Dict[str, dict]:
 def is_duplicate_category(user_cats: Dict[str, dict], candidate: dict) -> bool:
     """
     Проверяет, есть ли у пользователя уже категория с таким же
-    platform+topic (или platform без топика для канала).
+    platform+topic. Для каналов (без топика) дополнительно сравнивается
+    название категории, чтобы разные категории канала не блокировали друг друга.
     """
     c_platform = candidate.get("platform", "")
     c_topic = candidate.get("topic")
+    c_name = candidate.get("name", "").strip().lower()
     for cat in user_cats.values():
-        if cat.get("platform") == c_platform and cat.get("topic") == c_topic:
-            return True
+        if cat.get("platform") != c_platform:
+            continue
+        if c_topic is not None:
+            # Для групп (с топиком) — уникальность по platform+topic
+            if cat.get("topic") == c_topic:
+                return True
+        else:
+            # Для каналов (без топика) — уникальность по platform+name
+            if cat.get("topic") is None and cat.get("name", "").strip().lower() == c_name:
+                return True
     return False
 
 
 def user_already_has_category(user_cats: Dict[str, dict], candidate: dict) -> Optional[str]:
     """
     Возвращает ключ категории, если у пользователя уже есть категория
-    с таким же platform+topic, иначе None.
+    с таким же platform+topic (для групп) или platform+name (для каналов).
     """
     c_platform = candidate.get("platform", "")
     c_topic = candidate.get("topic")
+    c_name = candidate.get("name", "").strip().lower()
     for k, cat in user_cats.items():
-        if cat.get("platform") == c_platform and cat.get("topic") == c_topic:
-            return k
+        if cat.get("platform") != c_platform:
+            continue
+        if c_topic is not None:
+            if cat.get("topic") == c_topic:
+                return k
+        else:
+            if cat.get("topic") is None and cat.get("name", "").strip().lower() == c_name:
+                return k
     return None
 
 
